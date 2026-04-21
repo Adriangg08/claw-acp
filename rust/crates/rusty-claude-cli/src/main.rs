@@ -5822,13 +5822,26 @@ fn print_help_topic(topic: LocalHelpTopic) {
 ///
 /// With `addr = None` we speak ACP over stdio (default for editor/agent
 /// spawn). With `addr = Some(host:port)` a WebSocket listener is bound.
-/// Today the session layer is still stubbed — every request gets a
-/// structured "not yet implemented" JSON-RPC error — but the transport
-/// round-trip is real. See ROADMAP #76 for the full milestone plan.
+/// M1 (transport) and M2 (session lifecycle: `initialize`,
+/// `session/new`/`resume`/`close`/`list`) are wired; tool streaming
+/// (M3) and permission prompts (M4) still return a structured
+/// JSON-RPC `-32601` error. See ROADMAP #76 for the full milestone
+/// plan.
 fn run_acp_serve(addr: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    // M2: default workspace_root / data_dir to `None` so the server
+    // uses its own cwd. Editor clients (Zed, happy) can later pass an
+    // explicit root via a `--workspace-root` flag once we wire it
+    // through — see the M3 follow-up in ROADMAP #76.
     let options = match addr {
-        Some(addr) => acp::ServeOptions::WebSocket { addr },
-        None => acp::ServeOptions::Stdio,
+        Some(addr) => acp::ServeOptions::WebSocket {
+            addr,
+            workspace_root: None,
+            data_dir: None,
+        },
+        None => acp::ServeOptions::Stdio {
+            workspace_root: None,
+            data_dir: None,
+        },
     };
     let runtime = tokio::runtime::Runtime::new()?;
     runtime
