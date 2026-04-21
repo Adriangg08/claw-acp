@@ -342,7 +342,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
-        CliAction::AcpServe => run_acp_serve()?,
+        CliAction::AcpServe { addr } => run_acp_serve(addr)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         // #146: dispatch pure-local introspection. Text mode uses existing
@@ -471,10 +471,14 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     /// `claw acp serve` — hand off to the `acp` crate's ACP server.
-    /// Today the server is a scaffold and returns `NotImplemented`; this
-    /// variant exists so follow-up PRs can fill it in without re-touching
-    /// CLI parsing. See ROADMAP #76.
-    AcpServe,
+    ///
+    /// `addr` is `None` → stdio transport (default). `Some(host:port)` →
+    /// websocket transport bound to that address. The session + streaming
+    /// layers are still stubbed; see ROADMAP #76 for the full milestone
+    /// breakdown.
+    AcpServe {
+        addr: Option<String>,
+    },
     State {
         output_format: CliOutputFormat,
     },
@@ -1091,16 +1095,41 @@ fn removed_auth_surface_error(command_name: &str) -> String {
 fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     match args {
         [] => Ok(CliAction::Acp { output_format }),
-        // `claw acp serve` now routes into the `acp` crate scaffold.
-        // The server returns `NotImplemented` today; see ROADMAP #76.
+        // `claw acp serve [--addr host:port]` routes into the `acp` crate.
+        // With no `--addr`, stdio transport is used (default for editor
+        // spawn). With `--addr`, a websocket listener is bound.
         // Output format is intentionally not threaded here because the ACP
         // server speaks its own wire protocol rather than the CLI's
         // text/json success envelope.
-        [subcommand] if subcommand == "serve" => Ok(CliAction::AcpServe),
+        [subcommand, rest @ ..] if subcommand == "serve" => parse_acp_serve_args(rest),
         _ => Err(String::from(
-            "unsupported ACP invocation. Use `claw acp`, `claw acp serve`, `claw --acp`, or `claw -acp`.",
+            "unsupported ACP invocation. Use `claw acp`, `claw acp serve [--addr host:port]`, `claw --acp`, or `claw -acp`.",
         )),
     }
+}
+
+fn parse_acp_serve_args(args: &[String]) -> Result<CliAction, String> {
+    let mut addr: Option<String> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--addr" => {
+                let value = iter.next().ok_or_else(|| {
+                    String::from("--addr requires a value of the form host:port")
+                })?;
+                addr = Some(value.clone());
+            }
+            value if value.starts_with("--addr=") => {
+                addr = Some(value.trim_start_matches("--addr=").to_string());
+            }
+            other => {
+                return Err(format!(
+                    "unsupported `claw acp serve` argument {other:?}. Accepted flags: --addr <host:port>."
+                ));
+            }
+        }
+    }
+    Ok(CliAction::AcpServe { addr })
 }
 
 fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
@@ -5723,9 +5752,9 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Related          /doctor · claw --resume latest /doctor"
             .to_string(),
         LocalHelpTopic::Acp => "ACP / Zed
-  Usage            claw acp [serve] [--output-format <format>]
+  Usage            claw acp [serve [--addr host:port]] [--output-format <format>]
   Aliases          claw --acp · claw -acp
-  Purpose          explain the current editor-facing ACP/Zed launch contract without starting the runtime
+  Purpose          explain the current editor-facing ACP/Zed launch contract or start the ACP transport loop (M1: stdio/websocket; sessions still stubbed)
   Status           discoverability only; `serve` is a status alias and does not launch a daemon yet
   Formats          text (default), json
   Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · claw --help"
@@ -5789,14 +5818,22 @@ fn print_help_topic(topic: LocalHelpTopic) {
     println!("{}", render_help_topic(topic));
 }
 
-/// Hand off to the `acp` crate. Scaffold only — the server returns
-/// `NotImplemented` today. See ROADMAP #76 and `crates/acp/README.md`.
-fn run_acp_serve() -> Result<(), Box<dyn std::error::Error>> {
-    acp::serve(acp::ServeOptions {
-        stdio: true,
-        ..acp::ServeOptions::default()
-    })
-    .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
+/// Hand off to the `acp` crate's transport loop.
+///
+/// With `addr = None` we speak ACP over stdio (default for editor/agent
+/// spawn). With `addr = Some(host:port)` a WebSocket listener is bound.
+/// Today the session layer is still stubbed — every request gets a
+/// structured "not yet implemented" JSON-RPC error — but the transport
+/// round-trip is real. See ROADMAP #76 for the full milestone plan.
+fn run_acp_serve(addr: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let options = match addr {
+        Some(addr) => acp::ServeOptions::WebSocket { addr },
+        None => acp::ServeOptions::Stdio,
+    };
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime
+        .block_on(acp::serve(options))
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }
 
 fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
@@ -10045,12 +10082,35 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
-        // `claw acp serve` now routes to the `acp` crate scaffold instead
-        // of the status alias. The server is not implemented yet
-        // (ROADMAP #76); this lock ensures the parser keeps the handoff.
+        // `claw acp serve` now routes to the `acp` crate transport loop
+        // (M1). With no `--addr` it runs stdio; with `--addr host:port` it
+        // binds a websocket listener. The parser must preserve both paths.
         assert_eq!(
             parse_args(&["acp".to_string(), "serve".to_string()]).expect("acp serve should parse"),
-            CliAction::AcpServe
+            CliAction::AcpServe { addr: None }
+        );
+        assert_eq!(
+            parse_args(&[
+                "acp".to_string(),
+                "serve".to_string(),
+                "--addr".to_string(),
+                "127.0.0.1:4480".to_string()
+            ])
+            .expect("acp serve --addr should parse"),
+            CliAction::AcpServe {
+                addr: Some("127.0.0.1:4480".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "acp".to_string(),
+                "serve".to_string(),
+                "--addr=0.0.0.0:4480".to_string()
+            ])
+            .expect("acp serve --addr= should parse"),
+            CliAction::AcpServe {
+                addr: Some("0.0.0.0:4480".to_string()),
+            }
         );
         assert_eq!(
             parse_args(&["--acp".to_string()]).expect("--acp should parse"),
