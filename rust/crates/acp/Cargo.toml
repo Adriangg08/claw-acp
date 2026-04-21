@@ -5,14 +5,38 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Agent Client Protocol (ACP) server scaffold.
+# Agent Client Protocol (ACP) server for claw-code.
 # Tracks the spec at https://github.com/zed-industries/agent-client-protocol.
-# See crates/acp/README.md for scope and milestones; real implementation is
-# intentionally deferred — this crate only defines the module layout today.
+# See crates/acp/README.md for scope and milestones.
 
 [dependencies]
+async-trait.workspace = true
+futures-util.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    "io-std",
+    "net",
+    "sync",
+] }
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    "io-std",
+    "net",
+    "sync",
+    "test-util",
+    "time",
+] }
 
 [lints]
 workspace = true
