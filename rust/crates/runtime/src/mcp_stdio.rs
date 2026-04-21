@@ -1139,11 +1139,31 @@ impl McpServerManager {
     }
 }
 
+/// Wire framing protocol negotiated during MCP server initialization.
+///
+/// The MCP specification has evolved: early servers (and claw's test
+/// fixtures) use `Content-Length` HTTP-style framing (RFC 2616 headers
+/// followed by the JSON body).  Modern servers such as those built with
+/// the Python `mcp` SDK ≥1.0 use plain newline-delimited JSON (NDJSON).
+/// We auto-detect the protocol by peeking at the first byte of the
+/// server's response after sending the initialize request: `{` signals
+/// NDJSON, anything else is treated as Content-Length framing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpWireProtocol {
+    /// `Content-Length: N\r\n\r\n<body>` framing (legacy, default).
+    #[default]
+    ContentLength,
+    /// One JSON object per line, newline-terminated (Python MCP SDK ≥1.0).
+    NewlineDelimited,
+}
+
 #[derive(Debug)]
 pub struct McpStdioProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// Wire protocol detected (or assumed) for this connection.
+    pub protocol: McpWireProtocol,
 }
 
 impl McpStdioProcess {
@@ -1170,6 +1190,7 @@ impl McpStdioProcess {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            protocol: McpWireProtocol::default(),
         })
     }
 
@@ -1246,14 +1267,51 @@ impl McpStdioProcess {
         Ok(payload)
     }
 
+    /// Read one newline-delimited JSON message from stdout.
+    async fn read_ndjson_frame(&mut self) -> io::Result<Vec<u8>> {
+        let mut line = String::new();
+        let bytes_read = self.stdout.read_line(&mut line).await?;
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "MCP stdio stream closed while reading NDJSON line",
+            ));
+        }
+        Ok(line.trim_end_matches(['\r', '\n']).as_bytes().to_vec())
+    }
+
+    /// Peek at the first byte of the next response to decide whether the
+    /// server uses newline-delimited JSON (`{` as first byte) or
+    /// Content-Length framing.  The peeked byte stays in the buffer and
+    /// will be consumed by the subsequent `read_frame` / `read_ndjson_frame`
+    /// call.  This must be called once, before the first `read_jsonrpc_message`.
+    pub async fn detect_protocol(&mut self) -> io::Result<()> {
+        // BufReader::fill_buf() reads ahead without consuming.
+        let buf = self.stdout.fill_buf().await?;
+        if buf.first().copied() == Some(b'{') {
+            self.protocol = McpWireProtocol::NewlineDelimited;
+        }
+        Ok(())
+    }
+
     pub async fn write_jsonrpc_message<T: Serialize>(&mut self, message: &T) -> io::Result<()> {
         let body = serde_json::to_vec(message)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        self.write_frame(&body).await
+        match self.protocol {
+            McpWireProtocol::ContentLength => self.write_frame(&body).await,
+            McpWireProtocol::NewlineDelimited => {
+                self.write_all(&body).await?;
+                self.write_all(b"\n").await?;
+                self.flush().await
+            }
+        }
     }
 
     pub async fn read_jsonrpc_message<T: DeserializeOwned>(&mut self) -> io::Result<T> {
-        let payload = self.read_frame().await?;
+        let payload = match self.protocol {
+            McpWireProtocol::ContentLength => self.read_frame().await?,
+            McpWireProtocol::NewlineDelimited => self.read_ndjson_frame().await?,
+        };
         serde_json::from_slice(&payload)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
@@ -1308,7 +1366,42 @@ impl McpStdioProcess {
         id: JsonRpcId,
         params: McpInitializeParams,
     ) -> io::Result<JsonRpcResponse<McpInitializeResult>> {
-        self.request(id, "initialize", Some(params)).await
+        // Send the initialize request using Content-Length framing.
+        // Newline-delimited servers parse the JSON body from the third line
+        // (after the Content-Length header and the blank separator) with
+        // benign error logs for the header lines — the actual JSON payload
+        // arrives and is decoded correctly by the Python MCP SDK.
+        let method = "initialize";
+        let request = JsonRpcRequest::new(id.clone(), method, Some(params));
+        self.send_request(&request).await?;
+
+        // Peek at the server's response to auto-detect the wire protocol
+        // before attempting to read the message.
+        self.detect_protocol().await?;
+
+        let response: JsonRpcResponse<McpInitializeResult> = self.read_jsonrpc_message().await?;
+
+        if response.jsonrpc != "2.0" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "MCP response for {method} used unsupported jsonrpc version `{}`",
+                    response.jsonrpc
+                ),
+            ));
+        }
+
+        if response.id != id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "MCP response for {method} used mismatched id: expected {id:?}, got {:?}",
+                    response.id
+                ),
+            ));
+        }
+
+        Ok(response)
     }
 
     pub async fn list_tools(

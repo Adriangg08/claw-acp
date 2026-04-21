@@ -658,7 +658,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "setting": { "type": "string" },
                     "value": {
-                        "type": ["string", "boolean", "number"]
+                        "type": "string",
+                        "description": "The value to set (stringify booleans and numbers before passing)"
                     }
                 },
                 "required": ["setting"],

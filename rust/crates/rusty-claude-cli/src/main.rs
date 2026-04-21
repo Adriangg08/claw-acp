@@ -336,7 +336,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            // Resolve model from env / config when no --model flag was given.
+            // This mirrors the REPL path at resolve_repl_model() and ensures
+            // `claw prompt` honours the `"model"` key in settings.json.
+            let resolved_model = resolve_repl_model(model);
+            let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
