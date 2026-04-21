@@ -305,10 +305,7 @@ impl SessionHandler {
     /// Create a new session, persist it, and register it in the active
     /// registry. Returns the session id + the effective workspace root
     /// (the store's root, not the client's raw input — see Q1).
-    pub async fn handle_new(
-        &self,
-        params: NewSessionParams,
-    ) -> Result<NewSessionResult, AcpError> {
+    pub async fn handle_new(&self, params: NewSessionParams) -> Result<NewSessionResult, AcpError> {
         let workspace_root = self.store.workspace_root().to_path_buf();
 
         let mut session = Session::new().with_workspace_root(workspace_root.clone());
@@ -318,9 +315,9 @@ impl SessionHandler {
 
         let handle = self.store.create_handle(&session.session_id);
         session = session.with_persistence_path(handle.path.clone());
-        session.save_to_path(&handle.path).map_err(|err| {
-            AcpError::Store(format!("failed to persist new session: {err}"))
-        })?;
+        session
+            .save_to_path(&handle.path)
+            .map_err(|err| AcpError::Store(format!("failed to persist new session: {err}")))?;
 
         let session_id = session.session_id.clone();
         let slot = Arc::new(Mutex::new(SessionSlot {
@@ -553,7 +550,7 @@ mod tests {
             })
             .await
             .expect_err("must error");
-        match err {
+        match &err {
             AcpError::UnknownSession(msg) => {
                 assert!(
                     msg.contains("session-does-not-exist"),

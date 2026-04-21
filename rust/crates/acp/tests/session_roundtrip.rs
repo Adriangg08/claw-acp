@@ -27,10 +27,12 @@ fn transport_pair() -> (StdioTransport, StdioTransport) {
     let (a, b) = duplex(16 * 1024);
     let (a_r, a_w) = tokio::io::split(a);
     let (b_r, b_w) = tokio::io::split(b);
-    // Client reads bytes written to `a` (via a_r) and writes into `b`
-    // (via b_w). Server is wired in mirror.
-    let client = StdioTransport::from_io(a_r, b_w);
-    let server = StdioTransport::from_io(b_r, a_w);
+    // Each transport operates on one end of the duplex. Client owns `a`
+    // (reads from a_r, writes through a_w); server owns `b`. Writing
+    // through `a_w` is read by `b_r` (what the server sees), and vice
+    // versa — exactly the client/server topology the tests need.
+    let client = StdioTransport::from_io(a_r, a_w);
+    let server = StdioTransport::from_io(b_r, b_w);
     (client, server)
 }
 

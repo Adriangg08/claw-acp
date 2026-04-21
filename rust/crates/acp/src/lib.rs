@@ -229,12 +229,7 @@ async fn run_dispatch_loop<T: Transport>(
 ///
 /// Extracted so future milestones can unit-test dispatch without
 /// standing up a transport pair.
-async fn dispatch(
-    handler: &SessionHandler,
-    id: &Value,
-    method: &str,
-    params: Value,
-) -> Value {
+async fn dispatch(handler: &SessionHandler, id: &Value, method: &str, params: Value) -> Value {
     match method {
         "initialize" => {
             let params = parse_params::<InitializeParams>(params, id);
@@ -248,18 +243,14 @@ async fn dispatch(
         }
         "session/new" => match parse_params::<NewSessionParams>(params, id) {
             Ok(p) => match handler.handle_new(p).await {
-                Ok(result) => {
-                    ok_response(id, serde_json::to_value(result).unwrap_or(Value::Null))
-                }
+                Ok(result) => ok_response(id, serde_json::to_value(result).unwrap_or(Value::Null)),
                 Err(err) => session_error_response(id, &err),
             },
             Err(resp) => resp,
         },
         "session/resume" => match parse_params::<ResumeSessionParams>(params, id) {
             Ok(p) => match handler.handle_resume(p).await {
-                Ok(result) => {
-                    ok_response(id, serde_json::to_value(result).unwrap_or(Value::Null))
-                }
+                Ok(result) => ok_response(id, serde_json::to_value(result).unwrap_or(Value::Null)),
                 Err(err) => session_error_response(id, &err),
             },
             Err(resp) => resp,
@@ -279,10 +270,7 @@ async fn dispatch(
     }
 }
 
-fn parse_params<P: serde::de::DeserializeOwned>(
-    params: Value,
-    id: &Value,
-) -> Result<P, Value> {
+fn parse_params<P: serde::de::DeserializeOwned>(params: Value, id: &Value) -> Result<P, Value> {
     // `null` is treated as "no params", which is valid for any
     // `#[derive(Default)]` params type.
     if params.is_null() {

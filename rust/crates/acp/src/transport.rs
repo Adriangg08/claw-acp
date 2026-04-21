@@ -120,7 +120,7 @@ impl StdioTransport {
         loop {
             let mut byte = [0u8; 1];
             match self.reader.read_exact(&mut byte).await {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
                     if header_buf.is_empty() {
                         return Ok(None);
@@ -159,27 +159,24 @@ impl StdioTransport {
             };
             if name.trim().eq_ignore_ascii_case("content-length") {
                 let parsed: usize = value.trim().parse().map_err(|err| {
-                    TransportError::Protocol(format!(
-                        "invalid Content-Length {value:?}: {err}"
-                    ))
+                    TransportError::Protocol(format!("invalid Content-Length {value:?}: {err}"))
                 })?;
                 content_length = Some(parsed);
             }
             // Unknown headers are ignored for forward compatibility.
         }
 
-        let length = content_length.ok_or_else(|| {
-            TransportError::Protocol("missing Content-Length header".to_string())
-        })?;
+        let length = content_length
+            .ok_or_else(|| TransportError::Protocol("missing Content-Length header".to_string()))?;
 
         let mut body = vec![0u8; length];
         self.reader
             .read_exact(&mut body)
             .await
             .map_err(|err| match err.kind() {
-                io::ErrorKind::UnexpectedEof => TransportError::Protocol(
-                    "unexpected EOF while reading body".to_string(),
-                ),
+                io::ErrorKind::UnexpectedEof => {
+                    TransportError::Protocol("unexpected EOF while reading body".to_string())
+                }
                 _ => TransportError::Io(err),
             })?;
 
@@ -439,7 +436,10 @@ mod tests {
         transport.close().await.expect("second close ok");
 
         // After close, send/recv must surface Closed rather than panic.
-        let err = transport.send(json!({})).await.expect_err("send after close");
+        let err = transport
+            .send(json!({}))
+            .await
+            .expect_err("send after close");
         assert!(matches!(err, TransportError::Closed));
     }
 
