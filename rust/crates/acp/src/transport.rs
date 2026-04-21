@@ -312,7 +312,7 @@ impl Transport for WebSocketTransport {
         }
         let text = serde_json::to_string(&msg)?;
         self.ws
-            .send(WsMessage::Text(text.into()))
+            .send(WsMessage::Text(text))
             .await
             .map_err(Self::map_ws_error)
     }
@@ -480,7 +480,7 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = accept_async(MaybeTlsStream::Plain(stream)).await.unwrap();
-            ws.send(WsMessage::Binary(vec![1, 2, 3].into()))
+            ws.send(WsMessage::Binary(vec![1, 2, 3]))
                 .await
                 .unwrap();
             // Keep the connection open until the client closes it.
