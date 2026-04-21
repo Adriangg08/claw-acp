@@ -10,6 +10,7 @@ name = "claw"
 path = "src/main.rs"
 
 [dependencies]
+acp = { path = "../acp" }
 api = { path = "../api" }
 commands = { path = "../commands" }
 compat-harness = { path = "../compat-harness" }

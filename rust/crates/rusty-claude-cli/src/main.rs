@@ -342,6 +342,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
+        CliAction::AcpServe => run_acp_serve()?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         // #146: dispatch pure-local introspection. Text mode uses existing
@@ -469,6 +470,11 @@ enum CliAction {
     Acp {
         output_format: CliOutputFormat,
     },
+    /// `claw acp serve` — hand off to the `acp` crate's ACP server.
+    /// Today the server is a scaffold and returns `NotImplemented`; this
+    /// variant exists so follow-up PRs can fill it in without re-touching
+    /// CLI parsing. See ROADMAP #76.
+    AcpServe,
     State {
         output_format: CliOutputFormat,
     },
@@ -1085,7 +1091,12 @@ fn removed_auth_surface_error(command_name: &str) -> String {
 fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     match args {
         [] => Ok(CliAction::Acp { output_format }),
-        [subcommand] if subcommand == "serve" => Ok(CliAction::Acp { output_format }),
+        // `claw acp serve` now routes into the `acp` crate scaffold.
+        // The server returns `NotImplemented` today; see ROADMAP #76.
+        // Output format is intentionally not threaded here because the ACP
+        // server speaks its own wire protocol rather than the CLI's
+        // text/json success envelope.
+        [subcommand] if subcommand == "serve" => Ok(CliAction::AcpServe),
         _ => Err(String::from(
             "unsupported ACP invocation. Use `claw acp`, `claw acp serve`, `claw --acp`, or `claw -acp`.",
         )),
@@ -5778,6 +5789,16 @@ fn print_help_topic(topic: LocalHelpTopic) {
     println!("{}", render_help_topic(topic));
 }
 
+/// Hand off to the `acp` crate. Scaffold only — the server returns
+/// `NotImplemented` today. See ROADMAP #76 and `crates/acp/README.md`.
+fn run_acp_serve() -> Result<(), Box<dyn std::error::Error>> {
+    acp::serve(acp::ServeOptions {
+        stdio: true,
+        ..acp::ServeOptions::default()
+    })
+    .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
+}
+
 fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let message = "ACP/Zed editor integration is not implemented in claw-code yet. `claw acp serve` is only a discoverability alias today; it does not launch a daemon or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support.";
     match output_format {
@@ -10024,11 +10045,12 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
+        // `claw acp serve` now routes to the `acp` crate scaffold instead
+        // of the status alias. The server is not implemented yet
+        // (ROADMAP #76); this lock ensures the parser keeps the handoff.
         assert_eq!(
             parse_args(&["acp".to_string(), "serve".to_string()]).expect("acp serve should parse"),
-            CliAction::Acp {
-                output_format: CliOutputFormat::Text,
-            }
+            CliAction::AcpServe
         );
         assert_eq!(
             parse_args(&["--acp".to_string()]).expect("--acp should parse"),
