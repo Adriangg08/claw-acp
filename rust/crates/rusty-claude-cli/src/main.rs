@@ -7574,6 +7574,10 @@ impl AnthropicRuntimeClient {
         let mut events = Vec::new();
         let mut pending_tool: Option<(String, String, String)> = None;
         let mut block_has_thinking_summary = false;
+        // True while we're streaming visible reasoning_content (Moonshot Kimi
+        // K2.5/K2.6, DeepSeek-R1, o1). Distinct from block_has_thinking_summary,
+        // which suppresses repeated hidden-block placeholders.
+        let mut thinking_streaming = false;
         let mut saw_stop = false;
         let mut received_any_event = false;
 
@@ -7626,6 +7630,16 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                     ContentBlockDelta::TextDelta { text } => {
                         if !text.is_empty() {
+                            // Reasoning models (Kimi K2.6, DeepSeek-R1, o1)
+                            // stream the chain-of-thought first and then the
+                            // final answer. Close the dim "thinking" block and
+                            // announce the answer when text arrives.
+                            if thinking_streaming {
+                                thinking_streaming = false;
+                                write!(out, "\x1b[0m\n\n\x1b[1m💬 Answer\x1b[0m\n")
+                                    .and_then(|()| out.flush())
+                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            }
                             if let Some(progress_reporter) = &self.progress_reporter {
                                 progress_reporter.mark_text_phase(&text);
                             }
@@ -7642,16 +7656,43 @@ impl AnthropicRuntimeClient {
                             input.push_str(&partial_json);
                         }
                     }
-                    ContentBlockDelta::ThinkingDelta { .. } => {
-                        if !block_has_thinking_summary {
-                            render_thinking_block_summary(out, None, false)?;
-                            block_has_thinking_summary = true;
+                    ContentBlockDelta::ThinkingDelta { thinking } => {
+                        if thinking.is_empty() {
+                            // Anthropic-style hidden thinking: no text payload,
+                            // just the placeholder (legacy behavior).
+                            if !block_has_thinking_summary {
+                                render_thinking_block_summary(out, None, false)?;
+                                block_has_thinking_summary = true;
+                            }
+                        } else {
+                            // Provider (OpenAI-compat reasoning model) is
+                            // streaming the actual chain-of-thought. Print it
+                            // dimmed under a 💭 header so the user can see the
+                            // model is alive and what it's thinking about.
+                            if !thinking_streaming {
+                                thinking_streaming = true;
+                                write!(out, "\n\x1b[1m💭 Thinking\x1b[0m\n\x1b[2m")
+                                    .and_then(|()| out.flush())
+                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            }
+                            write!(out, "{thinking}")
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
                         }
                     }
                     ContentBlockDelta::SignatureDelta { .. } => {}
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
+                    if thinking_streaming {
+                        // Reasoning block ended without a following text block
+                        // (e.g. token budget hit after thinking). Reset dim
+                        // styling and drop a separator.
+                        thinking_streaming = false;
+                        write!(out, "\x1b[0m\n")
+                            .and_then(|()| out.flush())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    }
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
@@ -8570,9 +8611,27 @@ fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
-        OutputContentBlock::Thinking { thinking, .. } => {
-            render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
-            *block_has_thinking_summary = true;
+        OutputContentBlock::Thinking { thinking, signature } => {
+            // Anthropic extended-thinking blocks come with a `signature`
+            // (encrypted hash) and are meant to be hidden by default. Keep
+            // the legacy "▶ Thinking (N chars hidden)" summary for those.
+            //
+            // OpenAI-compat reasoning_content (Kimi K2.5/K2.6, DeepSeek-R1,
+            // o1) has no signature and its whole purpose is to surface the
+            // chain-of-thought — render it dimmed under a 💭 header.
+            if signature.is_some() {
+                render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
+                *block_has_thinking_summary = true;
+            } else if thinking.is_empty() {
+                // Streaming ContentBlockStart for a reasoning_content block —
+                // body arrives via subsequent ThinkingDelta events. Emit
+                // nothing here so we don't render a spurious placeholder.
+            } else {
+                write!(out, "\n\x1b[1m💭 Thinking\x1b[0m\n\x1b[2m{thinking}\x1b[0m\n")
+                    .and_then(|()| out.flush())
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                *block_has_thinking_summary = true;
+            }
         }
         OutputContentBlock::RedactedThinking { .. } => {
             render_thinking_block_summary(out, None, true)?;
@@ -12373,6 +12432,37 @@ UU conflicted.rs",
         let rendered = String::from_utf8(out).expect("utf8");
         assert!(rendered.contains("Heading"));
         assert!(rendered.contains('\u{1b}'));
+    }
+
+    /// A Thinking block with non-empty `thinking` comes from reasoning
+    /// models (Kimi K2.6, DeepSeek-R1, o1). The renderer must show the text
+    /// dimmed under a 💭 header rather than hiding it as Anthropic would.
+    #[test]
+    fn push_output_block_renders_reasoning_thinking_visibly() {
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        let mut pending_tool = None;
+        let mut block_has_thinking_summary = false;
+
+        push_output_block(
+            OutputContentBlock::Thinking {
+                thinking: "I am reasoning about koalas.".to_string(),
+                signature: None,
+            },
+            &mut out,
+            &mut events,
+            &mut pending_tool,
+            false,
+            &mut block_has_thinking_summary,
+        )
+        .expect("thinking block should render");
+
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(rendered.contains("I am reasoning about koalas."));
+        assert!(rendered.contains("💭"));
+        // Dim ANSI escape (\x1b[2m) — proof we're not just dumping raw text.
+        assert!(rendered.contains("\u{1b}[2m"));
+        assert!(block_has_thinking_summary);
     }
 
     #[test]

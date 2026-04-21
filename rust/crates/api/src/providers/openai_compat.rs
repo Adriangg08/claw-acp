@@ -437,8 +437,14 @@ impl OpenAiSseParser {
 struct StreamState {
     model: String,
     message_started: bool,
+    thinking_started: bool,
+    thinking_finished: bool,
     text_started: bool,
     text_finished: bool,
+    /// Block index for the text content block. Usually 0, but bumps to 1 when
+    /// a `reasoning_content` (Thinking) block came first so the two blocks have
+    /// distinct indices per the Anthropic streaming contract.
+    text_index: u32,
     finished: bool,
     stop_reason: Option<String>,
     usage: Option<Usage>,
@@ -450,8 +456,11 @@ impl StreamState {
         Self {
             model,
             message_started: false,
+            thinking_started: false,
+            thinking_finished: false,
             text_started: false,
             text_finished: false,
+            text_index: 0,
             finished: false,
             stop_reason: None,
             usage: None,
@@ -493,18 +502,54 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
+            // Reasoning / chain-of-thought streamed before the final answer.
+            // Emitted as an Anthropic-style Thinking block so downstream
+            // consumers (CLI renderer, tools crate) can distinguish it from
+            // the final assistant text.
+            if let Some(thinking) = choice
+                .delta
+                .reasoning_content
+                .filter(|value| !value.is_empty())
+            {
+                if !self.thinking_started {
+                    self.thinking_started = true;
+                    // Shift text to index 1 so thinking (index 0) and text
+                    // remain distinct blocks per the streaming contract.
+                    self.text_index = 1;
+                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: 0,
+                        content_block: OutputContentBlock::Thinking {
+                            thinking: String::new(),
+                            signature: None,
+                        },
+                    }));
+                }
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: ContentBlockDelta::ThinkingDelta { thinking },
+                }));
+            }
+
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
+                // Close any open thinking block before opening the text block —
+                // the protocol expects blocks to close in LIFO order.
+                if self.thinking_started && !self.thinking_finished {
+                    self.thinking_finished = true;
+                    events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                        index: 0,
+                    }));
+                }
                 if !self.text_started {
                     self.text_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                        index: 0,
+                        index: self.text_index,
                         content_block: OutputContentBlock::Text {
                             text: String::new(),
                         },
                     }));
                 }
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: 0,
+                    index: self.text_index,
                     delta: ContentBlockDelta::TextDelta { text: content },
                 }));
             }
@@ -557,10 +602,18 @@ impl StreamState {
         self.finished = true;
 
         let mut events = Vec::new();
+        // Close thinking block first (if it was never followed by content, e.g.
+        // the provider ran out of tokens after reasoning). LIFO close order.
+        if self.thinking_started && !self.thinking_finished {
+            self.thinking_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: 0,
+            }));
+        }
         if self.text_started && !self.text_finished {
             self.text_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: 0,
+                index: self.text_index,
             }));
         }
 
@@ -689,6 +742,12 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
+    /// Extended-thinking output from reasoning models (Moonshot Kimi K2.5/K2.6,
+    /// DeepSeek-R1, o1-style). Providers put the chain-of-thought here instead
+    /// of in `content`. Carried through as an Anthropic `Thinking` block so the
+    /// CLI can render it.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ResponseToolCall>,
 }
@@ -735,6 +794,13 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Streaming reasoning/chain-of-thought token for extended-thinking models
+    /// (e.g. Moonshot Kimi K2.5/K2.6, DeepSeek-R1). Before this was handled the
+    /// CLI would hang on `claw prompt --model kimi-k2.6 ...` because the whole
+    /// response arrived on `delta.reasoning_content` and nothing appeared on
+    /// `delta.content`.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
 }
@@ -1182,6 +1248,19 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
+    // Surface reasoning_content (extended thinking from Kimi K2.5/K2.6,
+    // DeepSeek-R1, o1-style) as a Thinking block. Emitted BEFORE text so it
+    // renders in order when the CLI walks the content vec.
+    if let Some(thinking) = choice
+        .message
+        .reasoning_content
+        .filter(|value| !value.is_empty())
+    {
+        content.push(OutputContentBlock::Thinking {
+            thinking,
+            signature: None,
+        });
+    }
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
         content.push(OutputContentBlock::Text { text });
     }
@@ -2195,9 +2274,16 @@ mod tests {
 
     #[test]
     fn provider_specific_size_limits_are_correct() {
-        assert_eq!(OpenAiCompatConfig::dashscope().max_request_body_bytes, 6_291_456); // 6MB
-        assert_eq!(OpenAiCompatConfig::openai().max_request_body_bytes, 104_857_600); // 100MB
-        assert_eq!(OpenAiCompatConfig::xai().max_request_body_bytes, 52_428_800); // 50MB
+        assert_eq!(
+            OpenAiCompatConfig::dashscope().max_request_body_bytes,
+            6_291_456
+        ); // 6MB
+        assert_eq!(
+            OpenAiCompatConfig::openai().max_request_body_bytes,
+            104_857_600
+        ); // 100MB
+        assert_eq!(OpenAiCompatConfig::xai().max_request_body_bytes, 52_428_800);
+        // 50MB
     }
 
     #[test]
@@ -2206,5 +2292,171 @@ mod tests {
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
         assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
+    }
+
+    /// Regression: reasoning models (Moonshot Kimi K2.5/K2.6, DeepSeek-R1,
+    /// o1-style) stream their chain-of-thought on `delta.reasoning_content`
+    /// instead of `delta.content`. Before this was handled the parser would
+    /// silently discard it and `claw prompt --model kimi-k2.6 ...` would hang.
+    #[test]
+    fn chunk_delta_captures_reasoning_content() {
+        let json = r#"{
+            "content": null,
+            "reasoning_content": "Let me think about this carefully.",
+            "role": "assistant"
+        }"#;
+        let delta: super::ChunkDelta =
+            serde_json::from_str(json).expect("delta with reasoning_content must parse");
+        assert_eq!(
+            delta.reasoning_content.as_deref(),
+            Some("Let me think about this carefully.")
+        );
+        assert!(delta.content.is_none());
+    }
+
+    /// Non-streaming path: some providers return `reasoning_content` on the
+    /// top-level message. Surface it so `normalize_response` can promote it
+    /// to a Thinking block when content is empty.
+    #[test]
+    fn chat_message_captures_reasoning_content() {
+        let json = r#"{
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "Thinking step by step: k, k, k."
+        }"#;
+        let message: super::ChatMessage =
+            serde_json::from_str(json).expect("message with reasoning_content must parse");
+        assert_eq!(
+            message.reasoning_content.as_deref(),
+            Some("Thinking step by step: k, k, k.")
+        );
+    }
+
+    /// End-to-end: when a stream delivers `reasoning_content` first and
+    /// `content` later, the state machine must emit Thinking blocks, close
+    /// them, and then open a Text block with a distinct index.
+    #[test]
+    fn stream_state_emits_thinking_block_for_reasoning_content() {
+        use crate::types::{ContentBlockDelta, OutputContentBlock, StreamEvent};
+
+        let mut state = super::StreamState::new("kimi-k2.6".to_string());
+
+        // Chunk 1: pure reasoning_content, no content.
+        let reasoning_chunk: super::ChatCompletionChunk = serde_json::from_str(
+            r#"{
+                "id": "chatcmpl-1",
+                "choices": [{
+                    "delta": {
+                        "role": "assistant",
+                        "content": null,
+                        "reasoning_content": "thinking tokens"
+                    },
+                    "finish_reason": null
+                }]
+            }"#,
+        )
+        .expect("reasoning chunk must parse");
+        let events = state
+            .ingest_chunk(reasoning_chunk)
+            .expect("ingest reasoning chunk");
+
+        let has_thinking_start = events.iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::ContentBlockStart(start)
+                    if matches!(start.content_block, OutputContentBlock::Thinking { .. })
+                        && start.index == 0
+            )
+        });
+        let has_thinking_delta = events.iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::ContentBlockDelta(delta)
+                    if matches!(&delta.delta, ContentBlockDelta::ThinkingDelta { thinking } if thinking == "thinking tokens")
+                        && delta.index == 0
+            )
+        });
+        assert!(has_thinking_start, "expected Thinking ContentBlockStart");
+        assert!(has_thinking_delta, "expected ThinkingDelta");
+
+        // Chunk 2: the actual answer — thinking must close, text must open at index 1.
+        let answer_chunk: super::ChatCompletionChunk = serde_json::from_str(
+            r#"{
+                "id": "chatcmpl-1",
+                "choices": [{
+                    "delta": {"content": "koala"},
+                    "finish_reason": "stop"
+                }]
+            }"#,
+        )
+        .expect("answer chunk must parse");
+        let events = state
+            .ingest_chunk(answer_chunk)
+            .expect("ingest answer chunk");
+
+        let has_thinking_stop = events.iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::ContentBlockStop(stop) if stop.index == 0
+            )
+        });
+        let has_text_start_at_one = events.iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::ContentBlockStart(start)
+                    if matches!(start.content_block, OutputContentBlock::Text { .. })
+                        && start.index == 1
+            )
+        });
+        let has_text_delta_at_one = events.iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::ContentBlockDelta(delta)
+                    if matches!(&delta.delta, ContentBlockDelta::TextDelta { text } if text == "koala")
+                        && delta.index == 1
+            )
+        });
+        assert!(
+            has_thinking_stop,
+            "thinking block must close before text opens"
+        );
+        assert!(has_text_start_at_one, "text block must open at index 1");
+        assert!(has_text_delta_at_one, "text delta must carry index 1");
+    }
+
+    /// Non-streaming: a response with empty content but populated
+    /// `reasoning_content` must surface a Thinking block so the CLI can show
+    /// the model's output instead of rendering a blank answer.
+    #[test]
+    fn normalize_response_promotes_reasoning_when_content_empty() {
+        use crate::types::OutputContentBlock;
+
+        let raw = r#"{
+            "id": "chatcmpl-xyz",
+            "model": "kimi-k2.6",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "I cannot produce an answer but I thought hard."
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+        let response: super::ChatCompletionResponse =
+            serde_json::from_str(raw).expect("response must parse");
+        let normalized = super::normalize_response("kimi-k2.6", response)
+            .expect("normalize_response must succeed");
+        let has_thinking = normalized.content.iter().any(|block| {
+            matches!(
+                block,
+                OutputContentBlock::Thinking { thinking, .. }
+                    if thinking == "I cannot produce an answer but I thought hard."
+            )
+        });
+        assert!(
+            has_thinking,
+            "expected Thinking block from reasoning_content"
+        );
     }
 }
