@@ -516,31 +516,59 @@ impl TerminalRenderer {
             })
             .collect::<Vec<_>>();
 
-        let border = format!("{}", "│".with(self.color_theme.table_border));
-        let separator = widths
-            .iter()
-            .map(|width| "─".repeat(*width + 2))
-            .collect::<Vec<_>>()
-            .join(&format!("{}", "┼".with(self.color_theme.table_border)));
-        let separator = format!("{border}{separator}{border}");
+        let color = self.color_theme.table_border;
+        let dashes: Vec<String> = widths.iter().map(|w| "─".repeat(*w + 2)).collect();
+
+        let top = format!(
+            "{}{}{}",
+            "┌".with(color),
+            dashes
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(&format!("{}", "┬".with(color))),
+            "┐".with(color)
+        );
+        let middle = format!(
+            "{}{}{}",
+            "├".with(color),
+            dashes
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(&format!("{}", "┼".with(color))),
+            "┤".with(color)
+        );
+        let bottom = format!(
+            "{}{}{}",
+            "└".with(color),
+            dashes
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(&format!("{}", "┴".with(color))),
+            "┘".with(color)
+        );
 
         let mut output = String::new();
+        output.push_str(&top);
+        output.push('\n');
+
         if !table.headers.is_empty() {
             output.push_str(&self.render_table_row(&table.headers, &widths, true));
             output.push('\n');
-            output.push_str(&separator);
             if !table.rows.is_empty() {
+                output.push_str(&middle);
                 output.push('\n');
             }
         }
 
-        for (index, row) in table.rows.iter().enumerate() {
+        for row in &table.rows {
             output.push_str(&self.render_table_row(row, &widths, false));
-            if index + 1 < table.rows.len() {
-                output.push('\n');
-            }
+            output.push('\n');
         }
 
+        output.push_str(&bottom);
         output
     }
 
@@ -971,10 +999,12 @@ mod tests {
         let plain_text = strip_ansi(&markdown_output);
         let lines = plain_text.lines().collect::<Vec<_>>();
 
-        assert_eq!(lines[0], "│ Name  │ Value │");
-        assert_eq!(lines[1], "│───────┼───────│");
-        assert_eq!(lines[2], "│ alpha │ 1     │");
-        assert_eq!(lines[3], "│ beta  │ 22    │");
+        assert_eq!(lines[0], "┌───────┬───────┐");
+        assert_eq!(lines[1], "│ Name  │ Value │");
+        assert_eq!(lines[2], "├───────┼───────┤");
+        assert_eq!(lines[3], "│ alpha │ 1     │");
+        assert_eq!(lines[4], "│ beta  │ 22    │");
+        assert_eq!(lines[5], "└───────┴───────┘");
         assert!(markdown_output.contains('\u{1b}'));
     }
 
