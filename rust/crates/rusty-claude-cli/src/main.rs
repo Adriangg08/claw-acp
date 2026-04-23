@@ -8156,6 +8156,20 @@ fn slash_command_completion_candidates_with_sessions(
     completions.into_iter().collect()
 }
 
+fn tool_verb(name: &str) -> &'static str {
+    match name {
+        "bash" | "Bash" => "execute",
+        "read_file" | "Read" => "load",
+        "write_file" | "Write" => "write",
+        "edit_file" | "Edit" => "patch",
+        "glob_search" | "Glob" => "search",
+        "grep_search" | "Grep" => "search",
+        "web_search" | "WebSearch" => "query",
+        "todo_write" | "TodoWrite" => "plan",
+        _ => "invoke",
+    }
+}
+
 fn format_tool_call_start(name: &str, input: &str) -> String {
     let parsed: serde_json::Value =
         serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_string()));
@@ -8203,10 +8217,20 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
         _ => summarize_tool_payload(input),
     };
 
-    let border = "─".repeat(name.len() + 8);
-    format!(
-        "\x1b[38;5;245m╭─ \x1b[1;36m{name}\x1b[0;38;5;245m ─╮\x1b[0m\n\x1b[38;5;245m│\x1b[0m {detail}\n\x1b[38;5;245m╰{border}╯\x1b[0m"
-    )
+    // A single-line header with `name ▸ verb` subtitle is more informative
+    // than the legacy boxed border whose width never matched the content.
+    // Body lines get a dim left gutter so the call reads as one block.
+    let verb = tool_verb(name);
+    let header = format!(
+        "\x1b[38;5;245m╭─ \x1b[1;36m{name}\x1b[0;38;5;245m ▸ \x1b[2;38;5;252m{verb}\x1b[0m",
+    );
+    let body = if detail.is_empty() {
+        String::new()
+    } else {
+        let prefixed = detail.replace('\n', "\n\x1b[38;5;245m│\x1b[0m ");
+        format!("\n\x1b[38;5;245m│\x1b[0m {prefixed}")
+    };
+    format!("{header}{body}")
 }
 
 fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
