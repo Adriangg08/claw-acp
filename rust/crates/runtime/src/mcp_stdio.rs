@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
 use std::future::Future;
 use std::io;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -1167,13 +1169,37 @@ pub struct McpStdioProcess {
 }
 
 impl McpStdioProcess {
+    /// Spawn without redirecting stderr. Used by unit tests that want to
+    /// observe spawned-process output directly. Production callers should
+    /// use [`spawn_with_log`] via [`spawn_mcp_stdio_process`].
     pub fn spawn(transport: &McpStdioTransport) -> io::Result<Self> {
+        Self::spawn_with_log(transport, None)
+    }
+
+    /// Spawn the MCP process and, when `server_name` is provided, route its
+    /// stderr to `~/.claw/logs/mcp/<server_name>.log`. This keeps noisy
+    /// MCPs — Python FastMCP's `INFO ListToolsRequest` chatter, `uv run`
+    /// deprecation warnings, `engram`'s GitHub update-check failures —
+    /// from leaking into the user's TTY. Stdout (the JSON-RPC wire) stays
+    /// on a pipe claw reads from.
+    ///
+    /// On any filesystem failure the stderr redirect falls back to
+    /// `Stdio::null()` rather than `Stdio::inherit()`, because inheriting
+    /// is exactly the noise we're trying to avoid — a best-effort redirect
+    /// that drops stderr on the floor is still quieter than leaking it.
+    pub fn spawn_with_log(
+        transport: &McpStdioTransport,
+        server_name: Option<&str>,
+    ) -> io::Result<Self> {
         let mut command = Command::new(&transport.command);
         command
             .args(&transport.args)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stdout(Stdio::piped());
+        match server_name {
+            Some(name) => command.stderr(open_mcp_stderr_log(name)),
+            None => command.stderr(Stdio::inherit()),
+        };
         apply_env(&mut command, &transport.env);
 
         let mut child = command.spawn()?;
@@ -1463,7 +1489,9 @@ impl McpStdioProcess {
 
 pub fn spawn_mcp_stdio_process(bootstrap: &McpClientBootstrap) -> io::Result<McpStdioProcess> {
     match &bootstrap.transport {
-        McpClientTransport::Stdio(transport) => McpStdioProcess::spawn(transport),
+        McpClientTransport::Stdio(transport) => {
+            McpStdioProcess::spawn_with_log(transport, Some(&bootstrap.server_name))
+        }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -1471,6 +1499,61 @@ pub fn spawn_mcp_stdio_process(bootstrap: &McpClientBootstrap) -> io::Result<Mcp
                 bootstrap.server_name
             ),
         )),
+    }
+}
+
+/// Resolve the log directory for MCP stderr capture. Honours
+/// `CLAW_LOG_HOME` and `CLAW_CONFIG_HOME`; falls back to `$HOME/.claw` or
+/// `$USERPROFILE/.claw` (Windows). Returns `<root>/logs/mcp`.
+#[must_use]
+pub fn mcp_stderr_log_dir() -> Option<PathBuf> {
+    let root = if let Ok(dir) = std::env::var("CLAW_LOG_HOME") {
+        PathBuf::from(dir)
+    } else if let Ok(dir) = std::env::var("CLAW_CONFIG_HOME") {
+        PathBuf::from(dir)
+    } else if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".claw")
+    } else if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        PathBuf::from(user_profile).join(".claw")
+    } else {
+        return None;
+    };
+    Some(root.join("logs").join("mcp"))
+}
+
+/// Sanitize a server name into a safe filename stem. Drops anything that
+/// isn't alphanumeric, dash, underscore, or period so e.g. `../etc/passwd`
+/// cannot become a log path.
+fn sanitize_server_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "mcp".to_string()
+    } else {
+        out
+    }
+}
+
+/// Open the append-mode log file for an MCP server's stderr. On any
+/// filesystem error, return `Stdio::null()` instead of inheriting — the
+/// goal is to keep MCP noise off the user's TTY at all costs.
+fn open_mcp_stderr_log(server_name: &str) -> Stdio {
+    let Some(dir) = mcp_stderr_log_dir() else {
+        return Stdio::null();
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return Stdio::null();
+    }
+    let path = dir.join(format!("{}.log", sanitize_server_name(server_name)));
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => Stdio::from(file),
+        Err(_) => Stdio::null(),
     }
 }
 
@@ -3017,5 +3100,75 @@ mod tests {
 
             cleanup_script(&script_path);
         });
+    }
+
+    /// Regression: FastMCP's default logger, `uv` deprecation warnings, and
+    /// `engram`'s "Could not check for updates" chatter all land on the MCP
+    /// process's stderr. Before this fix we inherited that stderr into
+    /// claw's TTY, producing a wall of noise before the spinner rendered.
+    /// `spawn_mcp_stdio_process` must redirect stderr to
+    /// `<CLAW_LOG_HOME>/logs/mcp/<server_name>.log` instead.
+    #[test]
+    fn spawn_mcp_stdio_process_redirects_stderr_to_log_file() {
+        let _guard = crate::test_env_lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        std::env::set_var("CLAW_LOG_HOME", &root);
+
+        let script_path = root.join("stderr-writer.sh");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\nprintf 'noisy chatter from the mcp server\\n' 1>&2\nsleep 0.1\n",
+        )
+        .expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let bootstrap = McpClientBootstrap {
+            server_name: "noisy-server".to_string(),
+            normalized_name: "noisy-server".to_string(),
+            tool_prefix: "noisy-server".to_string(),
+            signature: None,
+            transport: crate::mcp_client::McpClientTransport::Stdio(
+                crate::mcp_client::McpStdioTransport {
+                    command: script_path.to_string_lossy().into_owned(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                    tool_call_timeout_ms: None,
+                },
+            ),
+        };
+
+        // Wait for the child to exit so stderr is fully flushed to the
+        // log file before we read it. Tokio's `Command::spawn` requires
+        // the call itself to happen inside a runtime context too.
+        let rt = Builder::new_current_thread().enable_all().build().expect("rt");
+        rt.block_on(async {
+            let mut process = spawn_mcp_stdio_process(&bootstrap).expect("spawn process");
+            process.wait().await.expect("child wait");
+        });
+
+        let log_path = root.join("logs").join("mcp").join("noisy-server.log");
+        assert!(log_path.exists(), "log file should be created at {}", log_path.display());
+        let contents = fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            contents.contains("noisy chatter from the mcp server"),
+            "stderr should be captured to log file; got {contents:?}"
+        );
+
+        std::env::remove_var("CLAW_LOG_HOME");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Sanitizer should refuse path traversal so a hostile MCP name can't
+    /// write outside `<CLAW_LOG_HOME>/logs/mcp/`.
+    #[test]
+    fn sanitize_server_name_neutralizes_path_traversal() {
+        use super::sanitize_server_name;
+        assert_eq!(sanitize_server_name("normal-name_1.0"), "normal-name_1.0");
+        assert_eq!(sanitize_server_name("../etc/passwd"), ".._etc_passwd");
+        assert_eq!(sanitize_server_name("foo/bar"), "foo_bar");
+        assert_eq!(sanitize_server_name(""), "mcp");
     }
 }
