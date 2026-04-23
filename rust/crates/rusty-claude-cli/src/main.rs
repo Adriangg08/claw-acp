@@ -6583,6 +6583,9 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Thinking { reasoning } => {
+                    lines.push(format!("[thinking] {reasoning}"));
+                }
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
@@ -6766,6 +6769,14 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
                     let trimmed = text.trim_end();
                     if !trimmed.is_empty() {
                         lines.push(trimmed.to_string());
+                        lines.push(String::new());
+                    }
+                }
+                ContentBlock::Thinking { reasoning } => {
+                    let trimmed = reasoning.trim_end();
+                    if !trimmed.is_empty() {
+                        lines.push("**Thinking**".to_string());
+                        lines.push(format!("> {trimmed}"));
                         lines.push(String::new());
                     }
                 }
@@ -7678,6 +7689,11 @@ impl AnthropicRuntimeClient {
                             write!(out, "{thinking}")
                                 .and_then(|()| out.flush())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            // Persist the reasoning into conversation history
+                            // so the next request can re-send it as
+                            // `reasoning_content`. Moonshot rejects assistant
+                            // turns carrying tool_calls without it.
+                            events.push(AssistantEvent::ThinkingDelta(thinking));
                         }
                     }
                     ContentBlockDelta::SignatureDelta { .. } => {}
@@ -8631,6 +8647,9 @@ fn push_output_block(
                     .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 *block_has_thinking_summary = true;
+                // Non-streaming path: preserve the reasoning in conversation
+                // history so a follow-up request can re-send it.
+                events.push(AssistantEvent::ThinkingDelta(thinking));
             }
         }
         OutputContentBlock::RedactedThinking { .. } => {
@@ -8850,6 +8869,9 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Thinking { reasoning } => InputContentBlock::Thinking {
+                        thinking: reasoning.clone(),
+                    },
                     ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),

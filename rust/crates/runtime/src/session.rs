@@ -30,6 +30,16 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    /// Reasoning / chain-of-thought captured from an assistant turn.
+    ///
+    /// Stored so that multi-turn conversations with providers that enable
+    /// extended thinking (Moonshot Kimi K2.5/K2.6, DeepSeek-R1, o1-style)
+    /// can re-send `reasoning_content` on follow-up requests. Without this,
+    /// Moonshot returns HTTP 400 `"thinking is enabled but reasoning_content
+    /// is missing in assistant tool call message"`.
+    Thinking {
+        reasoning: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -737,6 +747,16 @@ impl ContentBlock {
                 object.insert("type".to_string(), JsonValue::String("text".to_string()));
                 object.insert("text".to_string(), JsonValue::String(text.clone()));
             }
+            Self::Thinking { reasoning } => {
+                object.insert(
+                    "type".to_string(),
+                    JsonValue::String("thinking".to_string()),
+                );
+                object.insert(
+                    "reasoning".to_string(),
+                    JsonValue::String(reasoning.clone()),
+                );
+            }
             Self::ToolUse { id, name, input } => {
                 object.insert(
                     "type".to_string(),
@@ -782,6 +802,9 @@ impl ContentBlock {
         {
             "text" => Ok(Self::Text {
                 text: required_string(object, "text")?,
+            }),
+            "thinking" => Ok(Self::Thinking {
+                reasoning: required_string(object, "reasoning")?,
             }),
             "tool_use" => Ok(Self::ToolUse {
                 id: required_string(object, "id")?,
@@ -1151,6 +1174,43 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Regression: `ContentBlock::Thinking` must round-trip through the
+    /// JSONL session file so that a resumed session still carries the
+    /// reasoning_content needed by extended-thinking providers (Moonshot
+    /// Kimi K2.5/K2.6, DeepSeek-R1, o1) on follow-up turns with tool_calls.
+    #[test]
+    fn content_block_thinking_round_trips_through_session_json() {
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::assistant(vec![
+                ContentBlock::Thinking {
+                    reasoning: "step by step analysis".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "bash".to_string(),
+                    input: "ls /tmp".to_string(),
+                },
+            ]))
+            .expect("assistant message should append");
+
+        let path = temp_session_path("thinking-roundtrip");
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored.messages.len(), 1);
+        let blocks = &restored.messages[0].blocks;
+        assert!(matches!(
+            blocks.first(),
+            Some(ContentBlock::Thinking { reasoning }) if reasoning == "step by step analysis"
+        ));
+        assert!(matches!(
+            blocks.get(1),
+            Some(ContentBlock::ToolUse { name, .. }) if name == "bash"
+        ));
+    }
 
     #[test]
     fn session_timestamps_are_monotonic_under_tight_loops() {

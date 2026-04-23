@@ -81,6 +81,16 @@ pub enum InputContentBlock {
     Text {
         text: String,
     },
+    /// Reasoning / chain-of-thought captured on a previous assistant turn.
+    /// Carried through conversation history so multi-turn calls with
+    /// extended-thinking providers (Moonshot Kimi K2.5/K2.6, DeepSeek-R1,
+    /// o1-style) can re-send the `reasoning_content` field required on
+    /// assistant messages that also carry `tool_calls`. Without it
+    /// Moonshot rejects the follow-up with HTTP 400 `"thinking is enabled
+    /// but reasoning_content is missing in assistant tool call message"`.
+    Thinking {
+        thinking: String,
+    },
     ToolUse {
         id: String,
         name: String,

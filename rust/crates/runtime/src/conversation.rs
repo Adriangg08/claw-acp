@@ -29,6 +29,12 @@ pub struct ApiRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
     TextDelta(String),
+    /// Chain-of-thought / reasoning delta from extended-thinking providers
+    /// (Moonshot Kimi K2.5/K2.6, DeepSeek-R1, o1-style). Accumulated into a
+    /// `ContentBlock::Thinking` so it round-trips through conversation
+    /// history and can be re-sent on follow-up requests — Moonshot rejects
+    /// assistant messages carrying `tool_calls` without it.
+    ThinkingDelta(String),
     ToolUse {
         id: String,
         name: String,
@@ -714,6 +720,7 @@ fn build_assistant_message(
     RuntimeError,
 > {
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut blocks = Vec::new();
     let mut prompt_cache_events = Vec::new();
     let mut finished = false;
@@ -721,8 +728,21 @@ fn build_assistant_message(
 
     for event in events {
         match event {
-            AssistantEvent::TextDelta(delta) => text.push_str(&delta),
+            AssistantEvent::TextDelta(delta) => {
+                // Text implicitly closes any open reasoning block. Extended-
+                // thinking providers emit reasoning first, then the answer.
+                flush_reasoning_block(&mut reasoning, &mut blocks);
+                text.push_str(&delta);
+            }
+            AssistantEvent::ThinkingDelta(delta) => {
+                // Reasoning after text is unusual but possible (some providers
+                // interleave). Always flush pending text before extending
+                // reasoning so block order matches the wire order.
+                flush_text_block(&mut text, &mut blocks);
+                reasoning.push_str(&delta);
+            }
             AssistantEvent::ToolUse { id, name, input } => {
+                flush_reasoning_block(&mut reasoning, &mut blocks);
                 flush_text_block(&mut text, &mut blocks);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
             }
@@ -734,6 +754,7 @@ fn build_assistant_message(
         }
     }
 
+    flush_reasoning_block(&mut reasoning, &mut blocks);
     flush_text_block(&mut text, &mut blocks);
 
     if !finished {
@@ -756,6 +777,14 @@ fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
             text: std::mem::take(text),
+        });
+    }
+}
+
+fn flush_reasoning_block(reasoning: &mut String, blocks: &mut Vec<ContentBlock>) {
+    if !reasoning.is_empty() {
+        blocks.push(ContentBlock::Thinking {
+            reasoning: std::mem::take(reasoning),
         });
     }
 }
@@ -1706,6 +1735,39 @@ mod tests {
         assert!(error
             .to_string()
             .contains("assistant stream ended without a message stop event"));
+    }
+
+    /// Regression: when a reasoning model streams `ThinkingDelta` before
+    /// `TextDelta` and `ToolUse`, the accumulator must store the reasoning
+    /// as a `ContentBlock::Thinking` in the session so the next request can
+    /// re-send it as `reasoning_content`. Moonshot Kimi K2.5/K2.6 rejects
+    /// assistant turns with `tool_calls` that are missing `reasoning_content`.
+    #[test]
+    fn build_assistant_message_persists_thinking_delta_into_content_blocks() {
+        let events = vec![
+            AssistantEvent::ThinkingDelta("Let me think ".to_string()),
+            AssistantEvent::ThinkingDelta("step by step.".to_string()),
+            AssistantEvent::ToolUse {
+                id: "call-1".to_string(),
+                name: "Bash".to_string(),
+                input: r#"{"command":"ls"}"#.to_string(),
+            },
+            AssistantEvent::MessageStop,
+        ];
+
+        let (message, _usage, _cache_events) =
+            build_assistant_message(events).expect("assistant message must build");
+
+        // Thinking must come BEFORE the tool_use block (same order as the
+        // wire stream) so the round-trip preserves provider expectations.
+        assert!(matches!(
+            message.blocks.first(),
+            Some(ContentBlock::Thinking { reasoning }) if reasoning == "Let me think step by step."
+        ));
+        assert!(matches!(
+            message.blocks.get(1),
+            Some(ContentBlock::ToolUse { name, .. }) if name == "Bash"
+        ));
     }
 
     #[test]

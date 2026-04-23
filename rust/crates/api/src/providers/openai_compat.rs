@@ -1014,10 +1014,12 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
     match message.role.as_str() {
         "assistant" => {
             let mut text = String::new();
+            let mut reasoning = String::new();
             let mut tool_calls = Vec::new();
             for block in &message.content {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
+                    InputContentBlock::Thinking { thinking } => reasoning.push_str(thinking),
                     InputContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                         "id": id,
                         "type": "function",
@@ -1029,7 +1031,7 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     InputContentBlock::ToolResult { .. } => {}
                 }
             }
-            if text.is_empty() && tool_calls.is_empty() {
+            if text.is_empty() && tool_calls.is_empty() && reasoning.is_empty() {
                 Vec::new()
             } else {
                 let mut msg = serde_json::json!({
@@ -1040,6 +1042,15 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                 // assistant messages with an explicit empty tool_calls array.
                 if !tool_calls.is_empty() {
                     msg["tool_calls"] = json!(tool_calls);
+                }
+                // Moonshot Kimi (K2.5/K2.6) requires `reasoning_content` on
+                // every assistant message that also carries `tool_calls` when
+                // extended thinking is enabled; otherwise it returns HTTP 400
+                // "thinking is enabled but reasoning_content is missing".
+                // Emitting it unconditionally when present is safe for other
+                // OpenAI-compatible providers — they ignore unknown fields.
+                if !reasoning.is_empty() {
+                    msg["reasoning_content"] = json!(reasoning);
                 }
                 vec![msg]
             }
@@ -1069,7 +1080,7 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     }
                     Some(msg)
                 }
-                InputContentBlock::ToolUse { .. } => None,
+                InputContentBlock::ToolUse { .. } | InputContentBlock::Thinking { .. } => None,
             })
             .collect(),
     }
@@ -2457,6 +2468,139 @@ mod tests {
         assert!(
             has_thinking,
             "expected Thinking block from reasoning_content"
+        );
+    }
+
+    /// Regression: Moonshot Kimi (K2.5/K2.6) requires `reasoning_content` on
+    /// every assistant message that also carries `tool_calls` when extended
+    /// thinking is enabled. Without it the follow-up request returns HTTP 400
+    /// "thinking is enabled but reasoning_content is missing in assistant
+    /// tool call message at index N". This test pins the wire format: a
+    /// conversation history with a `Thinking` block alongside a `ToolUse`
+    /// block on the same assistant message must serialize BOTH
+    /// `tool_calls` AND `reasoning_content`.
+    #[test]
+    fn assistant_message_with_thinking_and_tool_use_serializes_reasoning_content_and_tool_calls() {
+        use crate::types::{
+            InputContentBlock, InputMessage, MessageRequest, ToolDefinition,
+        };
+        use serde_json::json;
+
+        let request = MessageRequest {
+            model: "kimi/kimi-k2.6".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                InputMessage {
+                    role: "user".to_string(),
+                    content: vec![InputContentBlock::Text {
+                        text: "list /tmp".to_string(),
+                    }],
+                },
+                InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![
+                        InputContentBlock::Thinking {
+                            thinking: "The user wants to list /tmp; I should call Bash."
+                                .to_string(),
+                        },
+                        InputContentBlock::ToolUse {
+                            id: "call_abc123".to_string(),
+                            name: "Bash".to_string(),
+                            input: json!({"command": "ls /tmp"}),
+                        },
+                    ],
+                },
+                InputMessage {
+                    role: "user".to_string(),
+                    content: vec![InputContentBlock::ToolResult {
+                        tool_use_id: "call_abc123".to_string(),
+                        content: vec![crate::types::ToolResultContentBlock::Text {
+                            text: "a\nb\nc".to_string(),
+                        }],
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: Some(vec![ToolDefinition {
+                name: "Bash".to_string(),
+                description: Some("Run a shell command".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" }
+                    },
+                    "required": ["command"],
+                }),
+            }]),
+            ..MessageRequest::default()
+        };
+
+        let body = super::build_chat_completion_request(
+            &request,
+            super::OpenAiCompatConfig::dashscope(),
+        );
+        let messages = body["messages"]
+            .as_array()
+            .expect("messages must be an array");
+        // Assistant message sits at index 1 (user/assistant/tool_result).
+        let assistant = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message must be present in body");
+
+        assert_eq!(
+            assistant["reasoning_content"],
+            json!("The user wants to list /tmp; I should call Bash."),
+            "reasoning_content MUST be present on assistant message carrying tool_calls — \
+             Moonshot returns HTTP 400 without it: {assistant:#?}"
+        );
+        let tool_calls = assistant["tool_calls"]
+            .as_array()
+            .expect("tool_calls must be an array on assistant message");
+        assert_eq!(tool_calls.len(), 1, "expected exactly one tool call");
+        assert_eq!(tool_calls[0]["id"], json!("call_abc123"));
+        assert_eq!(tool_calls[0]["function"]["name"], json!("Bash"));
+    }
+
+    /// The same structural guarantee without tool_calls: pure thinking
+    /// plus text must still serialize `reasoning_content` so providers that
+    /// accept it receive the full context. Providers that don't care about
+    /// the field will ignore it — OpenAI-compat tolerates unknown fields.
+    #[test]
+    fn assistant_message_with_thinking_and_text_serializes_reasoning_content() {
+        use crate::types::{InputContentBlock, InputMessage, MessageRequest};
+
+        let request = MessageRequest {
+            model: "kimi/kimi-k2.6".to_string(),
+            max_tokens: 1024,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![
+                    InputContentBlock::Thinking {
+                        thinking: "pondering".to_string(),
+                    },
+                    InputContentBlock::Text {
+                        text: "done".to_string(),
+                    },
+                ],
+            }],
+            ..MessageRequest::default()
+        };
+
+        let body = super::build_chat_completion_request(
+            &request,
+            super::OpenAiCompatConfig::dashscope(),
+        );
+        let assistant = body["messages"]
+            .as_array()
+            .and_then(|m| m.iter().find(|msg| msg["role"] == "assistant"))
+            .expect("assistant message must be serialized");
+
+        assert_eq!(assistant["content"], serde_json::json!("done"));
+        assert_eq!(assistant["reasoning_content"], serde_json::json!("pondering"));
+        assert!(
+            assistant.get("tool_calls").is_none(),
+            "tool_calls must NOT appear when there are no tool uses"
         );
     }
 }

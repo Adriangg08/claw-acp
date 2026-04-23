@@ -4653,8 +4653,17 @@ async fn stream_with_provider(
                         input.push_str(&partial_json);
                     }
                 }
-                ContentBlockDelta::ThinkingDelta { .. }
-                | ContentBlockDelta::SignatureDelta { .. } => {}
+                ContentBlockDelta::ThinkingDelta { thinking } => {
+                    // Preserve reasoning_content from extended-thinking
+                    // providers (Moonshot Kimi K2.5/K2.6, DeepSeek-R1, o1) so
+                    // it round-trips through conversation history — Moonshot
+                    // rejects follow-up assistant turns with tool_calls
+                    // unless reasoning_content is re-sent.
+                    if !thinking.is_empty() {
+                        events.push(AssistantEvent::ThinkingDelta(thinking));
+                    }
+                }
+                ContentBlockDelta::SignatureDelta { .. } => {}
             },
             ApiStreamEvent::ContentBlockStop(stop) => {
                 if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
@@ -4753,6 +4762,9 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Thinking { reasoning } => InputContentBlock::Thinking {
+                        thinking: reasoning.clone(),
+                    },
                     ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
@@ -4805,7 +4817,19 @@ fn push_output_block(
             };
             pending_tools.insert(block_index, (id, name, initial_input));
         }
-        OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
+        OutputContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
+            // Only OpenAI-compat reasoning_content (no signature) is meant to
+            // persist into conversation history here. Anthropic extended-
+            // thinking blocks are signed and handled via the Anthropic
+            // provider's own echo contract, not through this path.
+            if signature.is_none() && !thinking.is_empty() {
+                events.push(AssistantEvent::ThinkingDelta(thinking));
+            }
+        }
+        OutputContentBlock::RedactedThinking { .. } => {}
     }
 }
 

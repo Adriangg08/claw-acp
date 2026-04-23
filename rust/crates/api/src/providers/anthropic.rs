@@ -994,6 +994,28 @@ fn strip_unsupported_beta_body_fields(body: &mut Value) {
                 object.insert("stop_sequences".to_string(), stop_val);
             }
         }
+        // Anthropic-side safeguard: any assistant `thinking` block we persisted
+        // from an OpenAI-compat provider (Kimi K2.6, DeepSeek-R1, o1-style)
+        // lacks the signature Anthropic requires on echoed extended-thinking
+        // blocks. Drop those blocks before the request leaves — Anthropic
+        // rejects unsigned thinking with 400.
+        if let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) {
+            for message in messages.iter_mut() {
+                let Some(message_object) = message.as_object_mut() else {
+                    continue;
+                };
+                let Some(content) = message_object
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                content.retain(|block| {
+                    !(block.get("type") == Some(&Value::String("thinking".to_string()))
+                        && block.get("signature").is_none())
+                });
+            }
+        }
     }
 }
 
