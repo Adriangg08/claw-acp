@@ -3728,6 +3728,12 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    /// Cached display preference so `prepare_turn_runtime` — which builds
+    /// a fresh BuiltRuntime (and therefore a fresh AnthropicRuntimeClient)
+    /// for each turn — can re-apply it. Without this the user-configured
+    /// `reasoning_display` setting would be silently reset to the
+    /// `ReasoningDisplay::default()` (Collapsed) on every turn.
+    reasoning_display: ReasoningDisplay,
 }
 
 #[derive(Debug, Clone)]
@@ -4236,6 +4242,7 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            reasoning_display: ReasoningDisplay::default(),
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4248,6 +4255,7 @@ impl LiveCli {
     }
 
     fn set_reasoning_display(&mut self, display: ReasoningDisplay) {
+        self.reasoning_display = display;
         if let Some(rt) = self.runtime.runtime.as_mut() {
             rt.api_client_mut().set_reasoning_display(display);
         }
@@ -4313,7 +4321,7 @@ impl LiveCli {
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
-        let runtime = build_runtime(
+        let mut runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
@@ -4325,6 +4333,12 @@ impl LiveCli {
             None,
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
+        // Carry the user-configured reasoning display across the per-turn
+        // rebuild. Without this the fresh AnthropicRuntimeClient resets to
+        // ReasoningDisplay::default() (Collapsed) on every turn.
+        if let Some(rt) = runtime.runtime.as_mut() {
+            rt.api_client_mut().set_reasoning_display(self.reasoning_display);
+        }
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
         Ok((runtime, hook_abort_monitor))

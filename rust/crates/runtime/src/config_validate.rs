@@ -197,6 +197,14 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "trustedRoots",
         expected: FieldType::StringArray,
     },
+    FieldSpec {
+        // Controls how the CLI renders reasoning_content chain-of-thought
+        // (Moonshot Kimi K2.5/K2.6, DeepSeek-R1, o1). Accepted string
+        // values are "collapsed" (default), "full", "hidden". See the
+        // ReasoningDisplay enum in rusty-claude-cli.
+        name: "reasoning_display",
+        expected: FieldType::String,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
