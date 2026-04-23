@@ -58,6 +58,42 @@ use tools::{
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 
+/// How the CLI should surface reasoning_content chain-of-thought (Moonshot
+/// Kimi K2.5/K2.6, DeepSeek-R1, o1-style). Read from the merged settings
+/// key `"reasoning_display"`. Default is `Collapsed` — most users want the
+/// model's answer, not its scratchpad, and `/thinkback` exists for when
+/// they do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningDisplay {
+    /// Emit nothing about thinking while it streams; print a single-line
+    /// summary `💭 Thinking (N chars hidden — /thinkback to see)` once the
+    /// block closes or once the final-answer text arrives.
+    Collapsed,
+    /// Stream the dim chain-of-thought under a `💭 Thinking` header the way
+    /// the CLI did before this config knob existed.
+    Full,
+    /// Suppress the thinking block entirely — not even the collapsed
+    /// summary line. Intended for piped/CI output where a blank turn is
+    /// preferable to any metadata.
+    Hidden,
+}
+
+impl ReasoningDisplay {
+    fn from_config_value(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("full") => Self::Full,
+            Some("hidden") => Self::Hidden,
+            _ => Self::Collapsed,
+        }
+    }
+}
+
+impl Default for ReasoningDisplay {
+    fn default() -> Self {
+        Self::Collapsed
+    }
+}
+
 /// #148: Model provenance for `claw status` JSON/text output. Records where
 /// the resolved model string came from so claws don't have to re-read argv
 /// to audit whether their `--model` flag was honored vs falling back to env
@@ -342,6 +378,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let resolved_model = resolve_repl_model(model);
             let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
+            cli.set_reasoning_display(config_reasoning_display_for_current_dir());
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
@@ -1538,6 +1575,21 @@ fn config_model_for_current_dir() -> Option<String> {
     let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
     loader.load().ok()?.model().map(ToOwned::to_owned)
+}
+
+/// Resolve `reasoning_display` from the merged settings.json for the
+/// current workspace. Missing / invalid / IO-error all fall back to the
+/// `Collapsed` default rather than failing the turn.
+fn config_reasoning_display_for_current_dir() -> ReasoningDisplay {
+    let Ok(cwd) = env::current_dir() else {
+        return ReasoningDisplay::default();
+    };
+    let loader = ConfigLoader::default_for(&cwd);
+    let Ok(config) = loader.load() else {
+        return ReasoningDisplay::default();
+    };
+    let raw = config.get("reasoning_display").and_then(|value| value.as_str());
+    ReasoningDisplay::from_config_value(raw)
 }
 
 fn resolve_repl_model(cli_model: String) -> String {
@@ -3573,6 +3625,7 @@ fn run_repl(
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
+    cli.set_reasoning_display(config_reasoning_display_for_current_dir());
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
@@ -4169,6 +4222,12 @@ impl LiveCli {
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         if let Some(rt) = self.runtime.runtime.as_mut() {
             rt.api_client_mut().set_reasoning_effort(effort);
+        }
+    }
+
+    fn set_reasoning_display(&mut self, display: ReasoningDisplay) {
+        if let Some(rt) = self.runtime.runtime.as_mut() {
+            rt.api_client_mut().set_reasoning_display(display);
         }
     }
 
@@ -7476,6 +7535,7 @@ struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    reasoning_display: ReasoningDisplay,
 }
 
 impl AnthropicRuntimeClient {
@@ -7541,11 +7601,16 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            reasoning_display: ReasoningDisplay::default(),
         })
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    fn set_reasoning_display(&mut self, display: ReasoningDisplay) {
+        self.reasoning_display = display;
     }
 }
 
@@ -7636,9 +7701,16 @@ impl AnthropicRuntimeClient {
         let mut pending_tool: Option<(String, String, String)> = None;
         let mut block_has_thinking_summary = false;
         // True while we're streaming visible reasoning_content (Moonshot Kimi
-        // K2.5/K2.6, DeepSeek-R1, o1). Distinct from block_has_thinking_summary,
-        // which suppresses repeated hidden-block placeholders.
+        // K2.5/K2.6, DeepSeek-R1, o1) with reasoning_display = Full. Distinct
+        // from block_has_thinking_summary, which suppresses repeated
+        // hidden-block placeholders.
         let mut thinking_streaming = false;
+        // Char count accumulated during the current thinking block while
+        // reasoning_display is Collapsed/Hidden. Emit the summary line once
+        // (Collapsed) or never (Hidden) when the block closes.
+        let mut collapsed_thinking_chars: usize = 0;
+        let mut collapsed_summary_emitted = false;
+        let reasoning_display = self.reasoning_display;
         let mut saw_stop = false;
         let mut received_any_event = false;
 
@@ -7675,6 +7747,7 @@ impl AnthropicRuntimeClient {
                             &mut pending_tool,
                             true,
                             &mut block_has_thinking_summary,
+                            reasoning_display,
                         )?;
                     }
                 }
@@ -7686,6 +7759,7 @@ impl AnthropicRuntimeClient {
                         &mut pending_tool,
                         true,
                         &mut block_has_thinking_summary,
+                        reasoning_display,
                     )?;
                 }
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
@@ -7703,6 +7777,24 @@ impl AnthropicRuntimeClient {
                                 )
                                 .and_then(|()| out.flush())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            }
+                            // Collapsed reasoning: if we buffered a chain-of-
+                            // thought silently, surface it as a one-line summary
+                            // NOW — immediately before the answer — so the user
+                            // sees that the model did think. Hidden mode skips
+                            // the summary entirely.
+                            if !collapsed_summary_emitted
+                                && collapsed_thinking_chars > 0
+                                && matches!(reasoning_display, ReasoningDisplay::Collapsed)
+                            {
+                                write!(
+                                    out,
+                                    "{}\n",
+                                    format_collapsed_thinking_summary(collapsed_thinking_chars)
+                                )
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                collapsed_summary_emitted = true;
                             }
                             if let Some(progress_reporter) = &self.progress_reporter {
                                 progress_reporter.mark_text_phase(&text);
@@ -7723,37 +7815,48 @@ impl AnthropicRuntimeClient {
                     ContentBlockDelta::ThinkingDelta { thinking } => {
                         if thinking.is_empty() {
                             // Anthropic-style hidden thinking: no text payload,
-                            // just the placeholder (legacy behavior).
+                            // just the placeholder (legacy behavior). Always
+                            // show this — it's a one-line summary by design.
                             if !block_has_thinking_summary {
                                 render_thinking_block_summary(out, None, false)?;
                                 block_has_thinking_summary = true;
                             }
                         } else {
                             // Provider (OpenAI-compat reasoning model) is
-                            // streaming the actual chain-of-thought. Print it
-                            // dimmed under a 💭 header so the user can see the
-                            // model is alive and what it's thinking about. A
-                            // dim `│ ` gutter on each line gives the block a
-                            // blockquote-style visual hierarchy so it doesn't
-                            // read as flat prose next to the final answer.
-                            if !thinking_streaming {
-                                thinking_streaming = true;
-                                write!(
-                                    out,
-                                    "\n\x1b[1;38;5;183m💭 Thinking\x1b[0m\n\x1b[2;38;5;245m│ "
-                                )
-                                .and_then(|()| out.flush())
-                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            // streaming the actual chain-of-thought. Presentation
+                            // depends on reasoning_display:
+                            //   Full      → dim body under a 💭 Thinking header
+                            //               (legacy behavior).
+                            //   Collapsed → accumulate char count silently; emit
+                            //               one-line summary on block close or
+                            //               when the final-answer text arrives.
+                            //   Hidden    → accumulate silently, never print.
+                            // Regardless of display mode the deltas MUST be
+                            // persisted as AssistantEvent::ThinkingDelta so
+                            // follow-up requests can re-send them via
+                            // reasoning_content (Moonshot rejects assistant
+                            // turns carrying tool_calls without it).
+                            match reasoning_display {
+                                ReasoningDisplay::Full => {
+                                    if !thinking_streaming {
+                                        thinking_streaming = true;
+                                        write!(
+                                            out,
+                                            "\n\x1b[1;38;5;183m💭 Thinking\x1b[0m\n\x1b[2;38;5;245m│ "
+                                        )
+                                        .and_then(|()| out.flush())
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                    }
+                                    let gutter_text =
+                                        thinking.replace('\n', "\n\x1b[2;38;5;245m│ ");
+                                    write!(out, "{gutter_text}")
+                                        .and_then(|()| out.flush())
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                }
+                                ReasoningDisplay::Collapsed | ReasoningDisplay::Hidden => {
+                                    collapsed_thinking_chars += thinking.chars().count();
+                                }
                             }
-                            let gutter_text =
-                                thinking.replace('\n', "\n\x1b[2;38;5;245m│ ");
-                            write!(out, "{gutter_text}")
-                                .and_then(|()| out.flush())
-                                .map_err(|error| RuntimeError::new(error.to_string()))?;
-                            // Persist the reasoning into conversation history
-                            // so the next request can re-send it as
-                            // `reasoning_content`. Moonshot rejects assistant
-                            // turns carrying tool_calls without it.
                             events.push(AssistantEvent::ThinkingDelta(thinking));
                         }
                     }
@@ -7769,6 +7872,23 @@ impl AnthropicRuntimeClient {
                         write!(out, "\x1b[0m\n")
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    }
+                    // Collapsed mode: a thinking-only block closed before any
+                    // TextDelta arrived (e.g. the model went straight into a
+                    // tool call after reasoning). Flush the summary now so the
+                    // user still sees that reasoning happened.
+                    if !collapsed_summary_emitted
+                        && collapsed_thinking_chars > 0
+                        && matches!(reasoning_display, ReasoningDisplay::Collapsed)
+                    {
+                        write!(
+                            out,
+                            "{}\n",
+                            format_collapsed_thinking_summary(collapsed_thinking_chars)
+                        )
+                        .and_then(|()| out.flush())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        collapsed_summary_emitted = true;
                     }
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
                         write!(out, "{rendered}")
@@ -8687,6 +8807,7 @@ fn push_output_block(
     pending_tool: &mut Option<(String, String, String)>,
     streaming_tool_input: bool,
     block_has_thinking_summary: &mut bool,
+    reasoning_display: ReasoningDisplay,
 ) -> Result<(), RuntimeError> {
     match block {
         OutputContentBlock::Text { text } => {
@@ -8715,11 +8836,12 @@ fn push_output_block(
         OutputContentBlock::Thinking { thinking, signature } => {
             // Anthropic extended-thinking blocks come with a `signature`
             // (encrypted hash) and are meant to be hidden by default. Keep
-            // the legacy "▶ Thinking (N chars hidden)" summary for those.
+            // the legacy "▶ Thinking (N chars hidden)" summary for those —
+            // reasoning_display does not affect this path because Anthropic
+            // never exposes the plaintext anyway.
             //
             // OpenAI-compat reasoning_content (Kimi K2.5/K2.6, DeepSeek-R1,
-            // o1) has no signature and its whole purpose is to surface the
-            // chain-of-thought — render it dimmed under a 💭 header.
+            // o1) has no signature. Presentation depends on reasoning_display.
             if signature.is_some() {
                 render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
                 *block_has_thinking_summary = true;
@@ -8728,16 +8850,32 @@ fn push_output_block(
                 // body arrives via subsequent ThinkingDelta events. Emit
                 // nothing here so we don't render a spurious placeholder.
             } else {
-                let gutter_body = thinking.replace('\n', "\n\x1b[2;38;5;245m│ ");
-                write!(
-                    out,
-                    "\n\x1b[1;38;5;183m💭 Thinking\x1b[0m\n\x1b[2;38;5;245m│ {gutter_body}\x1b[0m\n"
-                )
-                .and_then(|()| out.flush())
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                match reasoning_display {
+                    ReasoningDisplay::Full => {
+                        let gutter_body = thinking.replace('\n', "\n\x1b[2;38;5;245m│ ");
+                        write!(
+                            out,
+                            "\n\x1b[1;38;5;183m💭 Thinking\x1b[0m\n\x1b[2;38;5;245m│ {gutter_body}\x1b[0m\n"
+                        )
+                        .and_then(|()| out.flush())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    }
+                    ReasoningDisplay::Collapsed => {
+                        writeln!(
+                            out,
+                            "{}",
+                            format_collapsed_thinking_summary(thinking.chars().count())
+                        )
+                        .and_then(|()| out.flush())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    }
+                    ReasoningDisplay::Hidden => {
+                        // no-op: do not print thinking at all.
+                    }
+                }
                 *block_has_thinking_summary = true;
-                // Non-streaming path: preserve the reasoning in conversation
-                // history so a follow-up request can re-send it.
+                // Always persist into conversation history so a follow-up
+                // request can re-send via reasoning_content.
                 events.push(AssistantEvent::ThinkingDelta(thinking));
             }
         }
@@ -8747,6 +8885,15 @@ fn push_output_block(
         }
     }
     Ok(())
+}
+
+/// One-line summary used by the Collapsed reasoning display. The `/thinkback`
+/// slash command is the documented way to re-inspect the hidden chain-of-
+/// thought for the previous turn.
+fn format_collapsed_thinking_summary(char_count: usize) -> String {
+    format!(
+        "\x1b[1;38;5;183m💭 Thinking\x1b[0m \x1b[2;38;5;245m({char_count} chars hidden — /thinkback to see)\x1b[0m"
+    )
 }
 
 fn response_to_events(
@@ -8765,6 +8912,10 @@ fn response_to_events(
             &mut pending_tool,
             false,
             &mut block_has_thinking_summary,
+            // Non-streaming response_to_events path: always render the full
+            // reasoning body for now. Callers of this API do not currently
+            // plumb display preferences; refactor if/when they do.
+            ReasoningDisplay::Full,
         )?;
         if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
@@ -9185,8 +9336,8 @@ mod tests {
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
-        STUB_COMMANDS,
+        PromptHistoryEntry, ReasoningDisplay, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -12565,6 +12716,7 @@ UU conflicted.rs",
             &mut pending_tool,
             false,
             &mut block_has_thinking_summary,
+            ReasoningDisplay::Full,
         )
         .expect("text block should render");
 
@@ -12574,8 +12726,8 @@ UU conflicted.rs",
     }
 
     /// A Thinking block with non-empty `thinking` comes from reasoning
-    /// models (Kimi K2.6, DeepSeek-R1, o1). The renderer must show the text
-    /// dimmed under a 💭 header rather than hiding it as Anthropic would.
+    /// models (Kimi K2.6, DeepSeek-R1, o1). With reasoning_display=Full the
+    /// renderer must show the text dimmed under a 💭 header.
     #[test]
     fn push_output_block_renders_reasoning_thinking_visibly() {
         let mut out = Vec::new();
@@ -12593,6 +12745,7 @@ UU conflicted.rs",
             &mut pending_tool,
             false,
             &mut block_has_thinking_summary,
+            ReasoningDisplay::Full,
         )
         .expect("thinking block should render");
 
@@ -12605,6 +12758,116 @@ UU conflicted.rs",
         // Gutter prefix turns the thinking block into a visual quote.
         assert!(rendered.contains("│ "));
         assert!(block_has_thinking_summary);
+    }
+
+    /// With reasoning_display=Collapsed, the body is replaced by a single
+    /// one-line summary referencing /thinkback.
+    #[test]
+    fn push_output_block_collapses_reasoning_thinking_to_one_line() {
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        let mut pending_tool = None;
+        let mut block_has_thinking_summary = false;
+
+        let body = "I am reasoning about koalas at length across multiple lines.\nLine two.";
+        let expected_chars = body.chars().count();
+
+        push_output_block(
+            OutputContentBlock::Thinking {
+                thinking: body.to_string(),
+                signature: None,
+            },
+            &mut out,
+            &mut events,
+            &mut pending_tool,
+            false,
+            &mut block_has_thinking_summary,
+            ReasoningDisplay::Collapsed,
+        )
+        .expect("thinking block should render");
+
+        let rendered = String::from_utf8(out).expect("utf8");
+        // Exact raw body must NOT leak.
+        assert!(
+            !rendered.contains("I am reasoning about koalas"),
+            "collapsed mode must not leak thinking body: {rendered:?}"
+        );
+        // One-line summary present with the exact char count and the
+        // /thinkback hint so users can discover the command.
+        assert!(rendered.contains(&format!("{expected_chars} chars hidden")));
+        assert!(rendered.contains("/thinkback"));
+        assert!(rendered.contains("💭"));
+        // No gutter — confirms we didn't fall into the Full renderer.
+        assert!(
+            !rendered.contains("│ "),
+            "collapsed must not render the gutter: {rendered:?}"
+        );
+        // Reasoning history is preserved regardless of display mode —
+        // Moonshot needs it echoed back on follow-up turns.
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], AssistantEvent::ThinkingDelta(_)));
+        assert!(block_has_thinking_summary);
+    }
+
+    /// With reasoning_display=Hidden, nothing about thinking appears — not
+    /// even the collapsed summary line — but the history is still preserved.
+    #[test]
+    fn push_output_block_hides_reasoning_thinking_entirely() {
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+        let mut pending_tool = None;
+        let mut block_has_thinking_summary = false;
+
+        push_output_block(
+            OutputContentBlock::Thinking {
+                thinking: "I am reasoning about koalas.".to_string(),
+                signature: None,
+            },
+            &mut out,
+            &mut events,
+            &mut pending_tool,
+            false,
+            &mut block_has_thinking_summary,
+            ReasoningDisplay::Hidden,
+        )
+        .expect("thinking block should render");
+
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(rendered.is_empty(), "hidden mode must emit nothing: {rendered:?}");
+        // History still captured so Moonshot replays still succeed.
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], AssistantEvent::ThinkingDelta(_)));
+    }
+
+    #[test]
+    fn reasoning_display_parses_config_values_with_collapsed_default() {
+        assert_eq!(
+            ReasoningDisplay::from_config_value(Some("full")),
+            ReasoningDisplay::Full
+        );
+        assert_eq!(
+            ReasoningDisplay::from_config_value(Some("FULL")),
+            ReasoningDisplay::Full
+        );
+        assert_eq!(
+            ReasoningDisplay::from_config_value(Some("hidden")),
+            ReasoningDisplay::Hidden
+        );
+        assert_eq!(
+            ReasoningDisplay::from_config_value(Some("collapsed")),
+            ReasoningDisplay::Collapsed
+        );
+        // Unknown / missing / empty all fall back to Collapsed (the new
+        // default behavior for reasoning-heavy turns).
+        assert_eq!(
+            ReasoningDisplay::from_config_value(Some("bananas")),
+            ReasoningDisplay::Collapsed
+        );
+        assert_eq!(
+            ReasoningDisplay::from_config_value(None),
+            ReasoningDisplay::Collapsed
+        );
+        assert_eq!(ReasoningDisplay::default(), ReasoningDisplay::Collapsed);
     }
 
     #[test]
@@ -12625,6 +12888,7 @@ UU conflicted.rs",
             &mut pending_tool,
             true,
             &mut block_has_thinking_summary,
+            ReasoningDisplay::Collapsed,
         )
         .expect("tool block should accumulate");
 
