@@ -120,6 +120,9 @@ impl Spinner {
         if !self.interactive {
             execute!(
                 out,
+                // Leading newline keeps the summary visually separated from
+                // whatever streamed last (code fence, table, raw tool output).
+                Print("\n"),
                 SetForegroundColor(theme.spinner_done),
                 Print(format!("✔ {label}\n")),
                 ResetColor
@@ -147,6 +150,7 @@ impl Spinner {
         if !self.interactive {
             execute!(
                 out,
+                Print("\n"),
                 SetForegroundColor(theme.spinner_failed),
                 Print(format!("✘ {label}\n")),
                 ResetColor
