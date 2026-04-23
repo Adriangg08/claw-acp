@@ -7647,9 +7647,12 @@ impl AnthropicRuntimeClient {
                             // announce the answer when text arrives.
                             if thinking_streaming {
                                 thinking_streaming = false;
-                                write!(out, "\x1b[0m\n\n\x1b[1m💬 Answer\x1b[0m\n")
-                                    .and_then(|()| out.flush())
-                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                write!(
+                                    out,
+                                    "\x1b[0m\n\n\x1b[1;38;5;117m💬 Answer\x1b[0m\n"
+                                )
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
                             }
                             if let Some(progress_reporter) = &self.progress_reporter {
                                 progress_reporter.mark_text_phase(&text);
@@ -7679,14 +7682,22 @@ impl AnthropicRuntimeClient {
                             // Provider (OpenAI-compat reasoning model) is
                             // streaming the actual chain-of-thought. Print it
                             // dimmed under a 💭 header so the user can see the
-                            // model is alive and what it's thinking about.
+                            // model is alive and what it's thinking about. A
+                            // dim `│ ` gutter on each line gives the block a
+                            // blockquote-style visual hierarchy so it doesn't
+                            // read as flat prose next to the final answer.
                             if !thinking_streaming {
                                 thinking_streaming = true;
-                                write!(out, "\n\x1b[1m💭 Thinking\x1b[0m\n\x1b[2m")
-                                    .and_then(|()| out.flush())
-                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                write!(
+                                    out,
+                                    "\n\x1b[1;38;5;183m💭 Thinking\x1b[0m\n\x1b[2;38;5;245m│ "
+                                )
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
                             }
-                            write!(out, "{thinking}")
+                            let gutter_text =
+                                thinking.replace('\n', "\n\x1b[2;38;5;245m│ ");
+                            write!(out, "{gutter_text}")
                                 .and_then(|()| out.flush())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
                             // Persist the reasoning into conversation history
@@ -8643,9 +8654,13 @@ fn push_output_block(
                 // body arrives via subsequent ThinkingDelta events. Emit
                 // nothing here so we don't render a spurious placeholder.
             } else {
-                write!(out, "\n\x1b[1m💭 Thinking\x1b[0m\n\x1b[2m{thinking}\x1b[0m\n")
-                    .and_then(|()| out.flush())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                let gutter_body = thinking.replace('\n', "\n\x1b[2;38;5;245m│ ");
+                write!(
+                    out,
+                    "\n\x1b[1;38;5;183m💭 Thinking\x1b[0m\n\x1b[2;38;5;245m│ {gutter_body}\x1b[0m\n"
+                )
+                .and_then(|()| out.flush())
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
                 *block_has_thinking_summary = true;
                 // Non-streaming path: preserve the reasoning in conversation
                 // history so a follow-up request can re-send it.
@@ -12482,8 +12497,11 @@ UU conflicted.rs",
         let rendered = String::from_utf8(out).expect("utf8");
         assert!(rendered.contains("I am reasoning about koalas."));
         assert!(rendered.contains("💭"));
-        // Dim ANSI escape (\x1b[2m) — proof we're not just dumping raw text.
-        assert!(rendered.contains("\u{1b}[2m"));
+        // Dim ANSI escape — proof we're not just dumping raw text. Modern
+        // renderer emits `\x1b[2;38;5;245m` (dim + dark-grey gutter color).
+        assert!(rendered.contains("\u{1b}[2;38;5;245m"));
+        // Gutter prefix turns the thinking block into a visual quote.
+        assert!(rendered.contains("│ "));
         assert!(block_has_thinking_summary);
     }
 
