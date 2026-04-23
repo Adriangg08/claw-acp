@@ -2967,6 +2967,51 @@ fn format_auto_compaction_notice(removed: usize) -> String {
     format!("[auto-compacted: removed {removed} messages]")
 }
 
+/// Subtle one-line footer summarising the turn: model, tokens, cost,
+/// elapsed time. Rendered in dim grey so it reads as metadata rather
+/// than part of the assistant reply. Uses the same pricing pipeline as
+/// the JSON output format so both surfaces agree.
+fn format_turn_footer(
+    model: &str,
+    usage: &TokenUsage,
+    elapsed: std::time::Duration,
+) -> String {
+    let model_label = resolve_model_alias(model);
+    let pricing = pricing_for_model(model).unwrap_or_else(ModelPricing::default_sonnet_tier);
+    let cost = usage.estimate_cost_usd_with_pricing(pricing).total_cost_usd();
+    let seconds = elapsed.as_secs_f64();
+    let secs_label = if seconds >= 10.0 {
+        format!("{seconds:.0}s")
+    } else {
+        format!("{seconds:.1}s")
+    };
+    let input = format_compact_count(usage.input_tokens);
+    let output = format_compact_count(usage.output_tokens);
+    let cache_read = usage.cache_read_input_tokens;
+    let cache_read_segment = if cache_read > 0 {
+        format!(" · {} cache", format_compact_count(cache_read))
+    } else {
+        String::new()
+    };
+    format!(
+        "\x1b[2;38;5;245m─ {model_label} · {input} in · {output} out{cache_read_segment} · {} · {secs_label}\x1b[0m",
+        format_usd(cost)
+    )
+}
+
+/// Compact thousands-grouping for the turn footer (e.g. 12345 -> "12.3k").
+fn format_compact_count(value: u32) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", f64::from(value) / 1_000_000.0)
+    } else if value >= 10_000 {
+        format!("{}k", value / 1_000)
+    } else if value >= 1_000 {
+        format!("{:.1}k", f64::from(value) / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
 fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<String>) {
     parse_git_status_metadata_for(
         &env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -4220,8 +4265,10 @@ impl LiveCli {
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let turn_started_at = std::time::Instant::now();
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
+        let elapsed = turn_started_at.elapsed();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
@@ -4230,7 +4277,10 @@ impl LiveCli {
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
-                println!();
+                println!(
+                    "{}",
+                    format_turn_footer(&self.model, &summary.usage, elapsed)
+                );
                 if let Some(event) = summary.auto_compaction {
                     println!(
                         "{}",
@@ -9120,8 +9170,8 @@ mod tests {
         format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
         format_issue_report, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
+        format_compact_count, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_result, format_turn_footer, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
@@ -12304,6 +12354,34 @@ UU conflicted.rs",
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].text, "hello");
         assert_eq!(entries[1].text, "world");
+    }
+
+    #[test]
+    fn format_compact_count_groups_thousands() {
+        assert_eq!(format_compact_count(0), "0");
+        assert_eq!(format_compact_count(42), "42");
+        assert_eq!(format_compact_count(1_234), "1.2k");
+        assert_eq!(format_compact_count(12_345), "12k");
+        assert_eq!(format_compact_count(1_200_000), "1.2M");
+    }
+
+    #[test]
+    fn format_turn_footer_shows_model_tokens_and_cost() {
+        let mut usage = runtime::TokenUsage::default();
+        usage.input_tokens = 2_412;
+        usage.output_tokens = 87;
+        let footer = format_turn_footer(
+            "kimi-k2.6",
+            &usage,
+            std::time::Duration::from_millis(2_400),
+        );
+        assert!(footer.contains("kimi-k2.6"), "model label: {footer}");
+        assert!(footer.contains("2.4k in"), "input tokens: {footer}");
+        assert!(footer.contains("87 out"), "output tokens: {footer}");
+        assert!(footer.contains("2.4s"), "elapsed: {footer}");
+        assert!(footer.contains('$'), "cost: {footer}");
+        // Dim grey SGR so the footer reads as metadata, not reply body.
+        assert!(footer.contains("\u{1b}[2;38;5;245m"));
     }
 
     #[test]
