@@ -47,6 +47,7 @@ impl Default for ColorTheme {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Spinner {
     frame_index: usize,
+    interactive: bool,
 }
 
 impl Spinner {
@@ -54,7 +55,23 @@ impl Spinner {
 
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        // Detect whether the process's stdout is attached to a real terminal.
+        // When it is not (piped, redirected, captured by CI), we skip the
+        // SavePosition / RestorePosition / Clear escapes entirely so
+        // transcripts stay readable. Callers that need a different target
+        // can override via `with_interactive`.
+        use std::io::IsTerminal;
+        Self {
+            frame_index: 0,
+            interactive: std::io::stdout().is_terminal(),
+        }
+    }
+
+    /// Force the interactive mode on or off (tests + non-stdout streams).
+    #[must_use]
+    pub fn with_interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
+        self
     }
 
     pub fn tick(
@@ -63,6 +80,21 @@ impl Spinner {
         theme: &ColorTheme,
         out: &mut impl Write,
     ) -> io::Result<()> {
+        if !self.interactive {
+            // Non-TTY: emit the label once on first tick, then stay quiet so
+            // piped transcripts don't get hundreds of overwrite escapes.
+            if self.frame_index == 0 {
+                self.frame_index = 1;
+                queue!(
+                    out,
+                    SetForegroundColor(theme.spinner_active),
+                    Print(format!("⏳ {label}\n")),
+                    ResetColor
+                )?;
+                out.flush()?;
+            }
+            return Ok(());
+        }
         let frame = Self::FRAMES[self.frame_index % Self::FRAMES.len()];
         self.frame_index += 1;
         queue!(
@@ -85,6 +117,15 @@ impl Spinner {
         out: &mut impl Write,
     ) -> io::Result<()> {
         self.frame_index = 0;
+        if !self.interactive {
+            execute!(
+                out,
+                SetForegroundColor(theme.spinner_done),
+                Print(format!("✔ {label}\n")),
+                ResetColor
+            )?;
+            return out.flush();
+        }
         execute!(
             out,
             MoveToColumn(0),
@@ -103,6 +144,15 @@ impl Spinner {
         out: &mut impl Write,
     ) -> io::Result<()> {
         self.frame_index = 0;
+        if !self.interactive {
+            execute!(
+                out,
+                SetForegroundColor(theme.spinner_failed),
+                Print(format!("✘ {label}\n")),
+                ResetColor
+            )?;
+            return out.flush();
+        }
         execute!(
             out,
             MoveToColumn(0),
@@ -1085,7 +1135,9 @@ mod tests {
     #[test]
     fn spinner_advances_frames() {
         let terminal_renderer = TerminalRenderer::new();
-        let mut spinner = Spinner::new();
+        // Force interactive mode so the frame escape sequences fire even when
+        // the test harness captures stdout (which short-circuits auto-detect).
+        let mut spinner = Spinner::new().with_interactive(true);
         let mut out = Vec::new();
         spinner
             .tick("Working", terminal_renderer.color_theme(), &mut out)
@@ -1096,5 +1148,26 @@ mod tests {
 
         let output = String::from_utf8_lossy(&out);
         assert!(output.contains("Working"));
+    }
+
+    #[test]
+    fn spinner_non_interactive_emits_label_once_without_cursor_escapes() {
+        let terminal_renderer = TerminalRenderer::new();
+        let mut spinner = Spinner::new().with_interactive(false);
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            spinner
+                .tick("Working", terminal_renderer.color_theme(), &mut out)
+                .expect("tick succeeds");
+        }
+        let output = String::from_utf8_lossy(&out).to_string();
+        // Label printed once — no repeated overwrites clobbering piped
+        // transcripts.
+        assert_eq!(output.matches("Working").count(), 1, "{output}");
+        // No SavePosition (ESC 7) / RestorePosition (ESC 8) / CSI clear-line
+        // sequences in non-interactive mode.
+        assert!(!output.contains("\u{1b}7"), "{output}");
+        assert!(!output.contains("\u{1b}8"), "{output}");
+        assert!(!output.contains("\u{1b}[2K"), "{output}");
     }
 }
