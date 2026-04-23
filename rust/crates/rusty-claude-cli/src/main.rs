@@ -3023,20 +3023,30 @@ fn format_auto_compaction_notice(removed: usize) -> String {
 /// elapsed time. Rendered in dim grey so it reads as metadata rather
 /// than part of the assistant reply. Uses the same pricing pipeline as
 /// the JSON output format so both surfaces agree.
+///
+/// When usage is missing (OpenAI-compat providers sometimes don't
+/// include it on streamed turns for reasoning models — Moonshot Kimi
+/// K2.5/K2.6, DeepSeek-R1), fall back to a minimal 'model · elapsed'
+/// footer instead of lying with '0 in · 0 out · $0.0000'. That misled
+/// users into thinking the turn was free and made cost tracking
+/// impossible to trust.
 fn format_turn_footer(
     model: &str,
     usage: &TokenUsage,
     elapsed: std::time::Duration,
 ) -> String {
     let model_label = resolve_model_alias(model);
-    let pricing = pricing_for_model(model).unwrap_or_else(ModelPricing::default_sonnet_tier);
-    let cost = usage.estimate_cost_usd_with_pricing(pricing).total_cost_usd();
     let seconds = elapsed.as_secs_f64();
     let secs_label = if seconds >= 10.0 {
         format!("{seconds:.0}s")
     } else {
         format!("{seconds:.1}s")
     };
+    if usage_is_effectively_empty(usage) {
+        return format!("\x1b[2;38;5;245m─ {model_label} · {secs_label}\x1b[0m");
+    }
+    let pricing = pricing_for_model(model).unwrap_or_else(ModelPricing::default_sonnet_tier);
+    let cost = usage.estimate_cost_usd_with_pricing(pricing).total_cost_usd();
     let input = format_compact_count(usage.input_tokens);
     let output = format_compact_count(usage.output_tokens);
     let cache_read = usage.cache_read_input_tokens;
@@ -3049,6 +3059,18 @@ fn format_turn_footer(
         "\x1b[2;38;5;245m─ {model_label} · {input} in · {output} out{cache_read_segment} · {} · {secs_label}\x1b[0m",
         format_usd(cost)
     )
+}
+
+/// True when the provider returned no usable usage data for the turn.
+/// Both core token counters zero AND no cache activity means the stream
+/// finished without any usage payload — happens on some OpenAI-compat
+/// reasoning-model turns. Better to hide the token segment entirely
+/// than pretend the turn cost $0.00.
+fn usage_is_effectively_empty(usage: &TokenUsage) -> bool {
+    usage.input_tokens == 0
+        && usage.output_tokens == 0
+        && usage.cache_read_input_tokens == 0
+        && usage.cache_creation_input_tokens == 0
 }
 
 /// Compact thousands-grouping for the turn footer (e.g. 12345 -> "12.3k").
@@ -12533,6 +12555,47 @@ UU conflicted.rs",
         assert!(footer.contains('$'), "cost: {footer}");
         // Dim grey SGR so the footer reads as metadata, not reply body.
         assert!(footer.contains("\u{1b}[2;38;5;245m"));
+    }
+
+    /// Some OpenAI-compat providers (Moonshot Kimi K2.5/K2.6) finish a
+    /// streaming turn without ever sending a usage payload. In that case
+    /// the footer must NOT lie with '0 in · 0 out · $0.0000' — it should
+    /// drop the token/cost segment entirely and show only
+    /// 'model · elapsed'. Honest failure > fake precision.
+    #[test]
+    fn format_turn_footer_hides_tokens_and_cost_when_usage_is_missing() {
+        let usage = runtime::TokenUsage::default();
+        let footer = format_turn_footer(
+            "kimi/kimi-k2.6",
+            &usage,
+            std::time::Duration::from_millis(5_800),
+        );
+        assert!(footer.contains("kimi-k2.6"), "model label: {footer}");
+        assert!(footer.contains("5.8s"), "elapsed: {footer}");
+        // The misleading pieces must be gone.
+        assert!(!footer.contains(" in "), "token-in segment must be hidden: {footer}");
+        assert!(!footer.contains(" out"), "token-out segment must be hidden: {footer}");
+        assert!(
+            !footer.contains('$'),
+            "cost segment must be hidden when usage is empty: {footer}"
+        );
+        // Still dim so the footer reads as metadata.
+        assert!(footer.contains("\u{1b}[2;38;5;245m"));
+    }
+
+    /// Any single non-zero counter means we got usage data — even cache
+    /// activity alone justifies the full footer.
+    #[test]
+    fn format_turn_footer_uses_full_shape_when_only_cache_tokens_present() {
+        let mut usage = runtime::TokenUsage::default();
+        usage.cache_read_input_tokens = 1_234;
+        let footer = format_turn_footer(
+            "claude-sonnet-4",
+            &usage,
+            std::time::Duration::from_millis(1_000),
+        );
+        assert!(footer.contains("1.2k cache"), "cache segment: {footer}");
+        assert!(footer.contains('$'), "cost segment present: {footer}");
     }
 
     #[test]
