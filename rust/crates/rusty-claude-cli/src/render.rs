@@ -140,6 +140,25 @@ impl Spinner {
         out.flush()
     }
 
+    /// End-of-turn happy path: retire the spinner WITHOUT printing a
+    /// "Done" label. The model/tokens/elapsed footer the caller emits
+    /// next is already a sufficient end-of-turn marker; the extra
+    /// "✔ ✨ Done" line was pure visual noise.
+    ///
+    /// Interactive mode: clear the current spinner line so the cursor
+    /// sits cleanly at column 0 for whatever the caller prints next.
+    /// Non-interactive mode: emit a single newline to separate the
+    /// streamed answer from the footer that follows.
+    pub fn finish_silent(&mut self, out: &mut impl Write) -> io::Result<()> {
+        self.frame_index = 0;
+        if !self.interactive {
+            execute!(out, Print("\n"))?;
+            return out.flush();
+        }
+        execute!(out, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+        out.flush()
+    }
+
     pub fn fail(
         &mut self,
         label: &str,
@@ -1152,6 +1171,40 @@ mod tests {
 
         let output = String::from_utf8_lossy(&out);
         assert!(output.contains("Working"));
+    }
+
+    #[test]
+    fn spinner_finish_silent_emits_no_done_label_non_interactive() {
+        let mut spinner = Spinner::new().with_interactive(false);
+        let mut out = Vec::new();
+        spinner
+            .finish_silent(&mut out)
+            .expect("finish_silent succeeds");
+        let output = String::from_utf8_lossy(&out).to_string();
+        // No "Done", no ✔, no ✨ — just the separator newline so the
+        // footer lands on a clean line.
+        assert!(
+            !output.contains("Done") && !output.contains('✔') && !output.contains('✨'),
+            "silent finish should not emit success glyphs: {output:?}"
+        );
+        assert_eq!(output, "\n");
+    }
+
+    #[test]
+    fn spinner_finish_silent_clears_line_interactive() {
+        let mut spinner = Spinner::new().with_interactive(true);
+        let mut out = Vec::new();
+        spinner
+            .finish_silent(&mut out)
+            .expect("finish_silent succeeds");
+        let output = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            !output.contains("Done") && !output.contains('✔') && !output.contains('✨'),
+            "silent finish should not emit success glyphs: {output:?}"
+        );
+        // Interactive mode clears the current line instead of writing the
+        // glyph (clear-to-end-of-line is `ESC [ 2 K`).
+        assert!(output.contains("\u{1b}[2K"), "{output:?}");
     }
 
     #[test]

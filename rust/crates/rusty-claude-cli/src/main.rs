@@ -4367,11 +4367,11 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                // Don't print "✔ ✨ Done" — the model/tokens/elapsed
+                // footer below already reads as a turn terminator and the
+                // extra line was pure clutter. finish_silent just retires
+                // the spinner so the footer lands on a clean line.
+                spinner.finish_silent(&mut stdout)?;
                 println!(
                     "{}",
                     format_turn_footer(&self.model, &summary.usage, elapsed)
