@@ -134,6 +134,10 @@ pub struct McpStdioServerConfig {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub tool_call_timeout_ms: Option<u64>,
+    /// Optional explicit wire-framing override. `None` = auto-detect.
+    /// Parsed from the `"protocol"` string field — see
+    /// [`crate::mcp_stdio::McpWireProtocol::parse_override`].
+    pub forced_protocol: Option<crate::mcp_stdio::McpWireProtocol>,
 }
 
 /// Configuration for an MCP server reached over HTTP or SSE.
@@ -964,6 +968,7 @@ fn parse_mcp_server_config(
             args: optional_string_array(object, "args", context)?.unwrap_or_default(),
             env: optional_string_map(object, "env", context)?.unwrap_or_default(),
             tool_call_timeout_ms: optional_u64(object, "toolCallTimeoutMs", context)?,
+            forced_protocol: parse_optional_mcp_protocol(object, context)?,
         })),
         "sse" => Ok(McpServerConfig::Sse(parse_mcp_remote_server_config(
             object, context,
@@ -1007,6 +1012,20 @@ fn parse_mcp_remote_server_config(
         headers_helper: optional_string(object, "headersHelper", context)?.map(str::to_string),
         oauth: parse_optional_mcp_oauth_config(object, context)?,
     })
+}
+
+fn parse_optional_mcp_protocol(
+    object: &BTreeMap<String, JsonValue>,
+    context: &str,
+) -> Result<Option<crate::mcp_stdio::McpWireProtocol>, ConfigError> {
+    let Some(value) = object.get("protocol") else {
+        return Ok(None);
+    };
+    let raw = value
+        .as_str()
+        .ok_or_else(|| ConfigError::Parse(format!("{context}.protocol: expected a string")))?;
+    crate::mcp_stdio::McpWireProtocol::parse_override(raw)
+        .map_err(|message| ConfigError::Parse(format!("{context}.protocol: {message}")))
 }
 
 fn parse_optional_mcp_oauth_config(
@@ -1610,6 +1629,108 @@ mod tests {
         assert_eq!(oauth.client_id, "runtime-client");
         assert_eq!(oauth.callback_port, Some(54_545));
         assert_eq!(oauth.scopes, vec!["org:read", "user:write"]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_mcp_stdio_protocol_override_from_settings() {
+        // Verifies the end-to-end deserializer for the per-MCP
+        // `"protocol"` field: acceptable string forms are ingested and
+        // surfaced on `McpStdioServerConfig::forced_protocol`, while
+        // unknown values fail loudly instead of falling back to auto.
+        use crate::mcp_stdio::McpWireProtocol;
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "engram": {
+                  "command": "uvx",
+                  "args": ["engram-mcp"],
+                  "protocol": "ndjson"
+                },
+                "legacy": {
+                  "command": "uvx",
+                  "args": ["legacy-mcp"],
+                  "protocol": "Content-Length"
+                },
+                "default-server": {
+                  "command": "uvx",
+                  "args": ["auto-mcp"]
+                },
+                "explicit-auto": {
+                  "command": "uvx",
+                  "args": ["auto-mcp"],
+                  "protocol": "auto"
+                }
+              }
+            }"#,
+        )
+        .expect("write user settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        let engram = loaded.mcp().get("engram").expect("engram entry");
+        match &engram.config {
+            McpServerConfig::Stdio(config) => assert_eq!(
+                config.forced_protocol,
+                Some(McpWireProtocol::NewlineDelimited)
+            ),
+            other => panic!("expected stdio, got {other:?}"),
+        }
+
+        let legacy = loaded.mcp().get("legacy").expect("legacy entry");
+        match &legacy.config {
+            McpServerConfig::Stdio(config) => {
+                assert_eq!(config.forced_protocol, Some(McpWireProtocol::ContentLength))
+            }
+            other => panic!("expected stdio, got {other:?}"),
+        }
+
+        for key in ["default-server", "explicit-auto"] {
+            let entry = loaded.mcp().get(key).expect("entry exists");
+            match &entry.config {
+                McpServerConfig::Stdio(config) => {
+                    assert_eq!(config.forced_protocol, None, "{key} should auto-detect")
+                }
+                other => panic!("expected stdio, got {other:?}"),
+            }
+        }
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_unknown_mcp_protocol_value() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"mcpServers":{"bad":{"command":"uvx","args":["x"],"protocol":"smoke-signals"}}}"#,
+        )
+        .expect("write user settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("unknown protocol should fail");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("mcpServers.bad")
+                && rendered.contains("protocol")
+                && rendered.contains("smoke-signals"),
+            "expected protocol error, got: {rendered}"
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

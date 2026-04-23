@@ -1147,9 +1147,16 @@ impl McpServerManager {
 /// fixtures) use `Content-Length` HTTP-style framing (RFC 2616 headers
 /// followed by the JSON body).  Modern servers such as those built with
 /// the Python `mcp` SDK ≥1.0 use plain newline-delimited JSON (NDJSON).
-/// We auto-detect the protocol by peeking at the first byte of the
+/// By default we auto-detect the protocol by peeking at the first byte of the
 /// server's response after sending the initialize request: `{` signals
 /// NDJSON, anything else is treated as Content-Length framing.
+///
+/// When auto-detection botches a server (some NDJSON servers like engram's
+/// Python implementation reply with `id: null` and a Parse error when they
+/// receive `Content-Length` headers), the user can override via a per-MCP
+/// `"protocol": "ndjson" | "content-length" | "auto"` field in
+/// `settings.json`. That skips [`McpStdioProcess::detect_protocol`] and sends
+/// the initialize request in the forced framing from the first byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum McpWireProtocol {
     /// `Content-Length: N\r\n\r\n<body>` framing (legacy, default).
@@ -1159,6 +1166,29 @@ pub enum McpWireProtocol {
     NewlineDelimited,
 }
 
+impl McpWireProtocol {
+    /// Parse a user-facing string from `settings.json`. Accepts
+    /// `"content-length"`, `"ndjson"`, `"newline-delimited"` — case-insensitive,
+    /// hyphens and underscores equivalent. Empty or `"auto"` returns `None`
+    /// to signal auto-detection (the default).
+    ///
+    /// Returns `Err` on any other value so config parsing can surface a
+    /// useful error rather than silently falling back to Content-Length.
+    pub fn parse_override(raw: &str) -> Result<Option<Self>, String> {
+        let normalized = raw.trim().to_ascii_lowercase().replace('_', "-");
+        match normalized.as_str() {
+            "" | "auto" => Ok(None),
+            "content-length" | "contentlength" => Ok(Some(Self::ContentLength)),
+            "ndjson" | "newline-delimited" | "newline-delimited-json" | "newlinedelimited" => {
+                Ok(Some(Self::NewlineDelimited))
+            }
+            other => Err(format!(
+                "unsupported MCP wire protocol `{other}` (expected `auto`, `ndjson`, or `content-length`)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct McpStdioProcess {
     child: Child,
@@ -1166,6 +1196,11 @@ pub struct McpStdioProcess {
     stdout: BufReader<ChildStdout>,
     /// Wire protocol detected (or assumed) for this connection.
     pub protocol: McpWireProtocol,
+    /// True when `protocol` was forced by the user via settings.json.
+    /// Disables the first-byte auto-detect peek in [`Self::initialize`] —
+    /// required for servers that reject the auto-detect probe's
+    /// Content-Length framing.
+    pub protocol_forced: bool,
 }
 
 impl McpStdioProcess {
@@ -1216,7 +1251,15 @@ impl McpStdioProcess {
             child,
             stdin,
             stdout: BufReader::new(stdout),
-            protocol: McpWireProtocol::default(),
+            // If the user forced a protocol in settings.json, honor it
+            // immediately so the very first `initialize` goes out in the
+            // right framing. Without this, servers whose NDJSON parser
+            // gags on Content-Length headers (engram) return `id: null`
+            // and the whole handshake fails.
+            protocol: transport
+                .forced_protocol
+                .unwrap_or_else(McpWireProtocol::default),
+            protocol_forced: transport.forced_protocol.is_some(),
         })
     }
 
@@ -1392,18 +1435,23 @@ impl McpStdioProcess {
         id: JsonRpcId,
         params: McpInitializeParams,
     ) -> io::Result<JsonRpcResponse<McpInitializeResult>> {
-        // Send the initialize request using Content-Length framing.
-        // Newline-delimited servers parse the JSON body from the third line
-        // (after the Content-Length header and the blank separator) with
-        // benign error logs for the header lines — the actual JSON payload
-        // arrives and is decoded correctly by the Python MCP SDK.
+        // Send the initialize request. When `protocol_forced` is true the
+        // framing comes from settings.json and auto-detection is skipped
+        // entirely — auto-detect would corrupt the handshake for servers
+        // whose NDJSON parser rejects Content-Length headers with
+        // `id: null` + Parse error (engram 1.12.0). Otherwise we fall back
+        // to the legacy behaviour: send in Content-Length, then peek at
+        // the server's reply's first byte to pick NDJSON vs Content-Length
+        // for every subsequent frame.
         let method = "initialize";
         let request = JsonRpcRequest::new(id.clone(), method, Some(params));
         self.send_request(&request).await?;
 
-        // Peek at the server's response to auto-detect the wire protocol
-        // before attempting to read the message.
-        self.detect_protocol().await?;
+        if !self.protocol_forced {
+            // Peek at the server's response to auto-detect the wire protocol
+            // before attempting to read the message.
+            self.detect_protocol().await?;
+        }
 
         let response: JsonRpcResponse<McpInitializeResult> = self.read_jsonrpc_message().await?;
 
@@ -1606,6 +1654,7 @@ mod tests {
         JsonRpcResponse, McpInitializeClientInfo, McpInitializeParams, McpInitializeResult,
         McpInitializeServerInfo, McpListToolsResult, McpReadResourceParams, McpReadResourceResult,
         McpServerManager, McpServerManagerError, McpStdioProcess, McpTool, McpToolCallParams,
+        McpWireProtocol,
     };
     use crate::McpLifecyclePhase;
 
@@ -1670,6 +1719,47 @@ mod tests {
             r"}).encode()",
             r"sys.stdout.buffer.write(f'{header_name}: {len(response)}\r\n\r\n'.encode() + response)",
             "sys.stdout.buffer.flush()",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("chmod");
+        script_path
+    }
+
+    /// NDJSON-only fake MCP server. Parses stdin line-by-line and writes
+    /// one JSON object per line to stdout. If the incoming line isn't
+    /// valid JSON (e.g. a `Content-Length:` header), it replies with
+    /// `id: null` + Parse error — mirroring engram 1.12.0's behaviour,
+    /// which is exactly what breaks claw's current auto-detect handshake.
+    fn write_ndjson_only_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("ndjson-only-mcp.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, sys",
+            "line = sys.stdin.readline()",
+            "try:",
+            "    request = json.loads(line)",
+            "except Exception:",
+            r"    sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':None,'error':{'code':-32700,'message':'Parse error'}}) + '\n')",
+            "    sys.stdout.flush()",
+            "    raise SystemExit(0)",
+            r"assert request['method'] == 'initialize'",
+            "response = {",
+            r"    'jsonrpc': '2.0',",
+            r"    'id': request['id'],",
+            r"    'result': {",
+            r"        'protocolVersion': request['params']['protocolVersion'],",
+            r"        'capabilities': {'tools': {}},",
+            r"        'serverInfo': {'name': 'fake-ndjson-mcp', 'version': '0.1.0'}",
+            r"    }",
+            "}",
+            r"sys.stdout.write(json.dumps(response) + '\n')",
+            "sys.stdout.flush()",
             "",
         ]
         .join("\n");
@@ -1947,6 +2037,7 @@ mod tests {
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "secret-value".to_string())]),
                 tool_call_timeout_ms: None,
+                forced_protocol: None,
             }),
         };
         McpClientBootstrap::from_scoped_config("stdio server", &config)
@@ -1965,6 +2056,7 @@ mod tests {
             args: vec![script_path.to_string_lossy().into_owned()],
             env,
             tool_call_timeout_ms: None,
+            forced_protocol: None,
         }
     }
 
@@ -2014,6 +2106,7 @@ mod tests {
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env,
                 tool_call_timeout_ms: None,
+                forced_protocol: None,
             }),
         }
     }
@@ -2058,6 +2151,128 @@ mod tests {
         let bootstrap = McpClientBootstrap::from_scoped_config("sdk server", &config);
         let error = spawn_mcp_stdio_process(&bootstrap).expect_err("non-stdio should fail");
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn parse_override_accepts_ndjson_content_length_and_auto() {
+        assert_eq!(
+            McpWireProtocol::parse_override("ndjson").expect("ndjson ok"),
+            Some(McpWireProtocol::NewlineDelimited)
+        );
+        assert_eq!(
+            McpWireProtocol::parse_override("NDJSON").expect("NDJSON ok"),
+            Some(McpWireProtocol::NewlineDelimited)
+        );
+        assert_eq!(
+            McpWireProtocol::parse_override("newline_delimited").expect("underscore ok"),
+            Some(McpWireProtocol::NewlineDelimited)
+        );
+        assert_eq!(
+            McpWireProtocol::parse_override("newline-delimited").expect("hyphen ok"),
+            Some(McpWireProtocol::NewlineDelimited)
+        );
+        assert_eq!(
+            McpWireProtocol::parse_override("content-length").expect("content-length ok"),
+            Some(McpWireProtocol::ContentLength)
+        );
+        assert_eq!(
+            McpWireProtocol::parse_override("Content-Length").expect("case-insensitive ok"),
+            Some(McpWireProtocol::ContentLength)
+        );
+        assert_eq!(
+            McpWireProtocol::parse_override("auto").expect("auto ok"),
+            None
+        );
+        assert_eq!(McpWireProtocol::parse_override("").expect("empty ok"), None);
+        let err =
+            McpWireProtocol::parse_override("http/2").expect_err("unknown protocol should fail");
+        assert!(err.contains("http/2"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn forced_ndjson_protocol_completes_initialize_against_ndjson_only_server() {
+        // Baseline: without `forced_protocol`, an NDJSON-only server that
+        // rejects Content-Length headers with `id: null` + Parse error
+        // breaks `initialize` with a mismatched-id error. Forcing NDJSON
+        // framing from the first byte skips the Content-Length probe and
+        // the handshake succeeds.
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_ndjson_only_script();
+
+            // auto-detect path fails because the server replies `id: null` to
+            // the Content-Length header line.
+            let auto_transport = crate::mcp_client::McpStdioTransport {
+                command: "python3".to_string(),
+                args: vec![script_path.to_string_lossy().into_owned()],
+                env: BTreeMap::new(),
+                tool_call_timeout_ms: None,
+                forced_protocol: None,
+            };
+            let mut auto_process =
+                McpStdioProcess::spawn(&auto_transport).expect("spawn auto process");
+            let auto_error = auto_process
+                .initialize(
+                    JsonRpcId::Number(6),
+                    McpInitializeParams {
+                        protocol_version: "2025-03-26".to_string(),
+                        capabilities: json!({"roots": {}}),
+                        client_info: McpInitializeClientInfo {
+                            name: "runtime-tests".to_string(),
+                            version: "0.1.0".to_string(),
+                        },
+                    },
+                )
+                .await
+                .expect_err("auto-detect should fail against ndjson-only server");
+            assert_eq!(auto_error.kind(), ErrorKind::InvalidData);
+            assert!(
+                auto_error.to_string().contains("mismatched id")
+                    || auto_error.to_string().contains("expected Number(6)"),
+                "expected mismatched-id error, got: {auto_error}"
+            );
+            let _ = auto_process.wait().await;
+
+            // Forced NDJSON path succeeds — this is the user-facing fix.
+            let forced_transport = crate::mcp_client::McpStdioTransport {
+                command: "python3".to_string(),
+                args: vec![script_path.to_string_lossy().into_owned()],
+                env: BTreeMap::new(),
+                tool_call_timeout_ms: None,
+                forced_protocol: Some(McpWireProtocol::NewlineDelimited),
+            };
+            let mut forced_process =
+                McpStdioProcess::spawn(&forced_transport).expect("spawn forced process");
+            assert!(forced_process.protocol_forced);
+            assert_eq!(forced_process.protocol, McpWireProtocol::NewlineDelimited);
+
+            let response = forced_process
+                .initialize(
+                    JsonRpcId::Number(6),
+                    McpInitializeParams {
+                        protocol_version: "2025-03-26".to_string(),
+                        capabilities: json!({"roots": {}}),
+                        client_info: McpInitializeClientInfo {
+                            name: "runtime-tests".to_string(),
+                            version: "0.1.0".to_string(),
+                        },
+                    },
+                )
+                .await
+                .expect("forced NDJSON initialize succeeds");
+            assert_eq!(response.id, JsonRpcId::Number(6));
+            assert_eq!(response.error, None);
+            let result = response.result.expect("result present");
+            assert_eq!(result.server_info.name, "fake-ndjson-mcp");
+
+            let status = forced_process.wait().await.expect("wait for exit");
+            assert!(status.success());
+
+            cleanup_script(&script_path);
+        });
     }
 
     #[test]
@@ -2233,6 +2448,7 @@ mod tests {
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([("MCP_TEST_TOKEN".to_string(), "direct-secret".to_string())]),
                 tool_call_timeout_ms: None,
+                forced_protocol: None,
             };
             let mut process = McpStdioProcess::spawn(&transport).expect("spawn transport directly");
             let ready = process.read_available().await.expect("read ready");
@@ -2495,6 +2711,7 @@ mod tests {
                             "200".to_string(),
                         )]),
                         tool_call_timeout_ms: Some(25),
+                        forced_protocol: None,
                     }),
                 },
             )]);
@@ -2548,6 +2765,7 @@ mod tests {
                             "1".to_string(),
                         )]),
                         tool_call_timeout_ms: Some(1_000),
+                        forced_protocol: None,
                     }),
                 },
             )]);
@@ -2883,6 +3101,7 @@ mod tests {
                             args: Vec::new(),
                             env: BTreeMap::new(),
                             tool_call_timeout_ms: None,
+                            forced_protocol: None,
                         }),
                     },
                 ),
@@ -3136,6 +3355,7 @@ mod tests {
                     args: Vec::new(),
                     env: BTreeMap::new(),
                     tool_call_timeout_ms: None,
+                    forced_protocol: None,
                 },
             ),
         };
@@ -3143,14 +3363,21 @@ mod tests {
         // Wait for the child to exit so stderr is fully flushed to the
         // log file before we read it. Tokio's `Command::spawn` requires
         // the call itself to happen inside a runtime context too.
-        let rt = Builder::new_current_thread().enable_all().build().expect("rt");
+        let rt = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
         rt.block_on(async {
             let mut process = spawn_mcp_stdio_process(&bootstrap).expect("spawn process");
             process.wait().await.expect("child wait");
         });
 
         let log_path = root.join("logs").join("mcp").join("noisy-server.log");
-        assert!(log_path.exists(), "log file should be created at {}", log_path.display());
+        assert!(
+            log_path.exists(),
+            "log file should be created at {}",
+            log_path.display()
+        );
         let contents = fs::read_to_string(&log_path).expect("read log");
         assert!(
             contents.contains("noisy chatter from the mcp server"),

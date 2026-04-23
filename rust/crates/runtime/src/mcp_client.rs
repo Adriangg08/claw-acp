@@ -21,6 +21,15 @@ pub struct McpStdioTransport {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub tool_call_timeout_ms: Option<u64>,
+    /// Optional user-forced wire framing. `None` keeps the default
+    /// auto-detect behavior (first-byte peek on the server's reply to
+    /// `initialize`). `Some(_)` skips detection entirely and sends the
+    /// very first request using the chosen framing — required for servers
+    /// whose NDJSON parser chokes on Content-Length headers (engram's
+    /// Python MCP SDK 1.12.0 returns `id: null` + Parse error, breaking
+    /// claw's id-matching). Configured via `"protocol"` in the server's
+    /// `mcpServers` entry.
+    pub forced_protocol: Option<crate::mcp_stdio::McpWireProtocol>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +88,7 @@ impl McpClientTransport {
                 args: config.args.clone(),
                 env: config.env.clone(),
                 tool_call_timeout_ms: config.tool_call_timeout_ms,
+                forced_protocol: config.forced_protocol,
             }),
             McpServerConfig::Sse(config) => Self::Sse(McpRemoteTransport {
                 url: config.url.clone(),
@@ -149,6 +159,7 @@ mod tests {
                 args: vec!["mcp-server".to_string()],
                 env: BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]),
                 tool_call_timeout_ms: Some(15_000),
+                forced_protocol: None,
             }),
         };
 
