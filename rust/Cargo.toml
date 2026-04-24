@@ -16,6 +16,8 @@ thiserror = "2"
 tracing = "0.1"
 async-trait = "0.1"
 futures-util = "0.3"
+sqlx = { version = "0.8", default-features = false }
+uuid = { version = "1", features = ["v4"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

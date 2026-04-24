@@ -5,6 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
 use crate::session::{Session, SessionError};
 
 /// Per-worktree session store that namespaces on-disk session files by
@@ -555,6 +558,421 @@ fn canonicalize_for_compare(path: &Path) -> PathBuf {
 
 fn path_is_within_workspace(path: &Path, workspace_root: &Path) -> bool {
     canonicalize_for_compare(path).starts_with(canonicalize_for_compare(workspace_root))
+}
+
+// ---------------------------------------------------------------------------
+// SessionBackend trait and supporting types (ACP M3 Phase 1, DESIGN.md §2)
+// ---------------------------------------------------------------------------
+
+/// Error type returned by [`SessionBackend`] operations.
+///
+/// Uses `thiserror` so each backend can surface its own root cause while the
+/// ACP layer converts it to a JSON-RPC error without inspecting internals.
+#[derive(Debug, thiserror::Error)]
+pub enum BackendError {
+    /// Underlying I/O failure (file backend).
+    #[error("session backend I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Database error (Postgres backend). Boxed to avoid pulling sqlx into
+    /// downstream crates that only use the file backend.
+    #[error("session backend database error: {0}")]
+    Database(String),
+
+    /// Event or session was not found where one was required.
+    #[error("session backend not found: {0}")]
+    NotFound(String),
+
+    /// Serialization / deserialization failure.
+    #[error("session backend serialization error: {0}")]
+    Serde(String),
+}
+
+impl From<SessionError> for BackendError {
+    fn from(err: SessionError) -> Self {
+        Self::Io(std::io::Error::other(err.to_string()))
+    }
+}
+
+/// Discriminant for the type of event stored in `session_events`.
+///
+/// Values map 1-to-1 with the `event_type` column in Postgres and the
+/// equivalent JSONL marker in the file backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredEventType {
+    Message,
+    Compaction,
+    PermissionRequest,
+    PermissionResponse,
+    Meta,
+}
+
+impl StoredEventType {
+    /// Convert to the string used in the `event_type` Postgres column.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Compaction => "compaction",
+            Self::PermissionRequest => "permission_request",
+            Self::PermissionResponse => "permission_response",
+            Self::Meta => "meta",
+        }
+    }
+}
+
+impl std::fmt::Display for StoredEventType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for StoredEventType {
+    type Err = BackendError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "message" => Ok(Self::Message),
+            "compaction" => Ok(Self::Compaction),
+            "permission_request" => Ok(Self::PermissionRequest),
+            "permission_response" => Ok(Self::PermissionResponse),
+            "meta" => Ok(Self::Meta),
+            other => Err(BackendError::Serde(format!(
+                "unknown event_type: {other}"
+            ))),
+        }
+    }
+}
+
+/// One persisted session event, shared between file and Postgres backends.
+///
+/// The `payload` field stores the full `SessionEvent` as serialized JSON.
+/// The `seq` field is a per-session monotonic counter (starting at 1) used for
+/// ordering and catch-up replay.  See DESIGN.md §1 (seq design) and §2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredEvent {
+    /// Per-session monotonic sequence number (1-based).
+    pub seq: i32,
+    /// Discriminant used for filtering / routing in the catch-up algorithm.
+    pub event_type: StoredEventType,
+    /// Speaker role: "user" | "assistant" | "tool" | "system" | null.
+    pub role: Option<String>,
+    /// Full event payload serialized as JSON.
+    pub payload: serde_json::Value,
+    /// Wall-clock timestamp (milliseconds since UNIX epoch).
+    pub created_at_ms: i64,
+}
+
+/// Compact summary row returned by [`SessionBackend::list_open_sessions`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummaryRow {
+    pub session_id: String,
+    pub workspace_root: String,
+    pub model: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub message_count: Option<i64>,
+}
+
+/// Abstracts session storage so unit tests use [`FileSessionBackend`] while
+/// production uses [`PostgresSessionBackend`] (in the `acp` crate).
+///
+/// All methods are `async` because the Postgres implementation needs async I/O.
+/// The file backend wraps synchronous I/O in `tokio::task::spawn_blocking`.
+///
+/// See DESIGN.md §2 for the full trait contract.
+#[async_trait]
+pub trait SessionBackend: Send + Sync {
+    /// Create a new session record. Returns `BackendError::Database` if the
+    /// `session_id` already exists (duplicate detection).
+    async fn create_session(&self, session: &Session) -> Result<(), BackendError>;
+
+    /// Load a session by id. Returns `None` if not found.
+    async fn load_session(&self, session_id: &str) -> Result<Option<Session>, BackendError>;
+
+    /// Append one event to the session's event log.  The `seq` value must be
+    /// provided by the caller (an `AtomicI32` on `SessionSlot`).
+    async fn append_event(
+        &self,
+        session_id: &str,
+        seq: i32,
+        event: &StoredEvent,
+    ) -> Result<(), BackendError>;
+
+    /// Load all events for a session ordered by `seq`.
+    ///
+    /// `since_seq` is an exclusive lower bound — pass `0` to load all events.
+    async fn load_events(
+        &self,
+        session_id: &str,
+        since_seq: i32,
+    ) -> Result<Vec<StoredEvent>, BackendError>;
+
+    /// Mark a session as closed.
+    async fn close_session(&self, session_id: &str) -> Result<(), BackendError>;
+
+    /// List all open sessions (not yet closed) for a given workspace root.
+    async fn list_open_sessions(
+        &self,
+        workspace_root: &str,
+    ) -> Result<Vec<SessionSummaryRow>, BackendError>;
+
+    /// Upsert a client-presence row. Called on attach and on each heartbeat.
+    async fn upsert_client_presence(
+        &self,
+        client_id: &str,
+        session_id: &str,
+        transport: &str,
+    ) -> Result<(), BackendError>;
+
+    /// Remove a client-presence row on clean disconnect.
+    async fn remove_client_presence(
+        &self,
+        client_id: &str,
+        session_id: &str,
+    ) -> Result<(), BackendError>;
+}
+
+/// File-based [`SessionBackend`] that wraps the existing [`SessionStore`].
+///
+/// Used as the default backend (and for all unit / integration tests that do
+/// not require Postgres). Presence methods are no-ops because the file backend
+/// does not track client connections.
+///
+/// DESIGN.md §2 Flag B: synchronous Session I/O is wrapped in
+/// `tokio::task::spawn_blocking` to preserve the async trait contract without
+/// blocking the Tokio thread pool.
+pub struct FileSessionBackend {
+    store: SessionStore,
+    /// In-memory set of session IDs that have been explicitly closed.
+    /// Used by `list_open_sessions` to filter out closed sessions.
+    /// Not persistent — re-starts begin with an empty set (acceptable for dev).
+    closed_sessions: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl FileSessionBackend {
+    /// Build a file backend from an existing [`SessionStore`].
+    #[must_use]
+    pub fn new(store: SessionStore) -> Self {
+        Self {
+            store,
+            closed_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl SessionBackend for FileSessionBackend {
+    async fn create_session(&self, session: &Session) -> Result<(), BackendError> {
+        let handle = self.store.create_handle(&session.session_id);
+        let session = session.clone().with_persistence_path(handle.path.clone());
+        tokio::task::spawn_blocking(move || session.save_to_path(&handle.path))
+            .await
+            .map_err(|err| BackendError::Io(std::io::Error::other(err.to_string())))??;
+        Ok(())
+    }
+
+    async fn load_session(&self, session_id: &str) -> Result<Option<Session>, BackendError> {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let result = tokio::task::spawn_blocking(move || store.load_session(&session_id))
+            .await
+            .map_err(|err| BackendError::Io(std::io::Error::other(err.to_string())))?;
+
+        match result {
+            Ok(loaded) => Ok(Some(loaded.session)),
+            Err(SessionControlError::Format(_)) => Ok(None),
+            Err(err) => Err(BackendError::from(SessionError::Io(
+                std::io::Error::other(err.to_string()),
+            ))),
+        }
+    }
+
+    async fn append_event(
+        &self,
+        _session_id: &str,
+        _seq: i32,
+        _event: &StoredEvent,
+    ) -> Result<(), BackendError> {
+        // File backend stores the full Session via push_message; individual
+        // event appends are no-ops here.  The JSONL log is maintained by
+        // Session::push_message / save_to_path on the live SessionSlot.
+        Ok(())
+    }
+
+    async fn load_events(
+        &self,
+        _session_id: &str,
+        _since_seq: i32,
+    ) -> Result<Vec<StoredEvent>, BackendError> {
+        // File backend does not have an event log separate from the session JSONL.
+        // Catch-up replay for the file backend is handled by Session::messages directly.
+        Ok(Vec::new())
+    }
+
+    async fn close_session(&self, session_id: &str) -> Result<(), BackendError> {
+        // Record closure in the in-memory set so list_open_sessions filters it out.
+        let mut guard = self
+            .closed_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.insert(session_id.to_string());
+        Ok(())
+    }
+
+    async fn list_open_sessions(
+        &self,
+        workspace_root: &str,
+    ) -> Result<Vec<SessionSummaryRow>, BackendError> {
+        let store = self.store.clone();
+        let workspace_root = workspace_root.to_string();
+        let closed: std::collections::HashSet<String> = {
+            let guard = self
+                .closed_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.clone()
+        };
+
+        let summaries = tokio::task::spawn_blocking(move || store.list_sessions())
+            .await
+            .map_err(|err| BackendError::Io(std::io::Error::other(err.to_string())))
+            .and_then(|r| r.map_err(|err| BackendError::Io(std::io::Error::other(err.to_string()))))?;
+
+        let now_ms: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok())
+            .unwrap_or(0);
+
+        let rows = summaries
+            .into_iter()
+            .filter(|s| !closed.contains(&s.id))
+            .map(|s| {
+                let updated_at_ms = i64::try_from(s.updated_at_ms).unwrap_or(i64::MAX);
+                let message_count = i64::try_from(s.message_count).unwrap_or(i64::MAX);
+                SessionSummaryRow {
+                    session_id: s.id,
+                    workspace_root: workspace_root.clone(),
+                    model: None,
+                    created_at_ms: now_ms,
+                    updated_at_ms,
+                    message_count: Some(message_count),
+                }
+            })
+            .collect();
+
+        Ok(rows)
+    }
+
+    async fn upsert_client_presence(
+        &self,
+        _client_id: &str,
+        _session_id: &str,
+        _transport: &str,
+    ) -> Result<(), BackendError> {
+        // File backend does not track client presence.
+        Ok(())
+    }
+
+    async fn remove_client_presence(
+        &self,
+        _client_id: &str,
+        _session_id: &str,
+    ) -> Result<(), BackendError> {
+        // File backend does not track client presence.
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::{
+        BackendError, FileSessionBackend, SessionBackend, SessionStore, StoredEvent,
+        StoredEventType,
+    };
+    use crate::session::Session;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("runtime-backend-test-{nanos}"))
+    }
+
+    fn make_backend() -> (FileSessionBackend, std::path::PathBuf) {
+        let root = temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        let store = SessionStore::from_cwd(&root).unwrap();
+        (FileSessionBackend::new(store), root)
+    }
+
+    #[tokio::test]
+    async fn file_backend_create_and_load_round_trip() {
+        let (backend, root) = make_backend();
+        let session = Session::new()
+            .with_workspace_root(root.clone());
+
+        backend.create_session(&session).await.unwrap();
+
+        let loaded = backend
+            .load_session(&session.session_id)
+            .await
+            .unwrap()
+            .expect("session should exist after create");
+
+        assert_eq!(loaded.session_id, session.session_id);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn file_backend_load_unknown_returns_none() {
+        let (backend, root) = make_backend();
+        let result = backend.load_session("nonexistent-session-id").await.unwrap();
+        assert!(result.is_none());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn file_backend_append_and_load_events_noop() {
+        let (backend, root) = make_backend();
+        let session = Session::new().with_workspace_root(root.clone());
+        backend.create_session(&session).await.unwrap();
+
+        let event = StoredEvent {
+            seq: 1,
+            event_type: StoredEventType::Message,
+            role: Some("user".to_string()),
+            payload: serde_json::json!({"type": "message", "text": "hello"}),
+            created_at_ms: 0,
+        };
+
+        // append_event is a no-op for file backend
+        backend
+            .append_event(&session.session_id, 1, &event)
+            .await
+            .unwrap();
+
+        // load_events returns empty for file backend
+        let events = backend.load_events(&session.session_id, 0).await.unwrap();
+        assert!(events.is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn file_backend_list_open_sessions() {
+        let (backend, root) = make_backend();
+        let session = Session::new().with_workspace_root(root.clone());
+        backend.create_session(&session).await.unwrap();
+
+        let rows = backend.list_open_sessions("/").await.unwrap();
+        assert!(!rows.is_empty());
+        fs::remove_dir_all(root).ok();
+    }
 }
 
 #[cfg(test)]

@@ -36,7 +36,10 @@ mod remote;
 pub mod sandbox;
 mod session;
 pub mod session_control;
-pub use session_control::SessionStore;
+pub use session_control::{
+    BackendError, FileSessionBackend, ManagedSessionSummary, SessionBackend, SessionStore,
+    SessionSummaryRow, StoredEvent, StoredEventType,
+};
 mod sse;
 pub mod stale_base;
 pub mod stale_branch;
