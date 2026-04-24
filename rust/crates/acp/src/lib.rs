@@ -377,6 +377,15 @@ async fn run_dispatch_loop<T: Transport>(
                 )
                 .await;
 
+                // Send the RPC response FIRST so the client's request-response cycle
+                // completes before catch-up notifications arrive. This matches the
+                // JSON-RPC 2.0 model: the response closes the request, and subsequent
+                // session/update notifications are independent server pushes.
+                if let Err(err) = transport.send(response).await {
+                    tracing::warn!(error = %err, "failed to send ACP response");
+                    return Err(err.into());
+                }
+
                 if let Some(sid) = new_session_id {
                     // Subscribe to the session's broadcast channel BEFORE any DB read
                     // (catch-up algorithm step 4 per DESIGN.md §6).
@@ -388,7 +397,13 @@ async fn run_dispatch_loop<T: Transport>(
                             .await
                             .unwrap_or_default();
 
-                        // Send stored events to this client (not broadcast).
+                        tracing::debug!(
+                            session_id = %sid,
+                            event_count = stored_events.len(),
+                            "replaying stored events to client"
+                        );
+
+                        // Send stored events to this client only (not broadcast).
                         for ev in &stored_events {
                             if let Ok(session_ev) =
                                 serde_json::from_value::<SessionEvent>(ev.payload.clone())
@@ -407,17 +422,12 @@ async fn run_dispatch_loop<T: Transport>(
                             }
                         }
 
-                        let _ = hwm; // catch-up hwm tracked implicitly by stored_events length
+                        let _ = hwm; // hwm is captured implicitly: all stored events sent above
                         active_session_id = Some(sid);
                         broadcast_rx = Some(rx);
                     } else {
                         active_session_id = Some(sid);
                     }
-                }
-
-                if let Err(err) = transport.send(response).await {
-                    tracing::warn!(error = %err, "failed to send ACP response");
-                    return Err(err.into());
                 }
             }
         }

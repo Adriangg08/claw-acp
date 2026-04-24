@@ -640,6 +640,12 @@ impl SessionHandler {
         })
     }
 
+    /// Get a reference to the slot arc for a session (for tests and diagnostics).
+    pub async fn get_slot(&self, session_id: &str) -> Option<Arc<Mutex<SessionSlot>>> {
+        let guard = self.runtimes.read().await;
+        guard.get(session_id).cloned()
+    }
+
     /// Subscribe to broadcast events for a session.
     ///
     /// Returns a `broadcast::Receiver` and the current `next_seq` value
