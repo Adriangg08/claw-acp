@@ -34,17 +34,26 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::Arc;
 
 use runtime::session_control::SessionControlError;
 use runtime::{FileSessionBackend, Session, SessionBackend, SessionStore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::broadcast;
 use tokio::sync::{Mutex, RwLock};
+
+use crate::stream::SessionEvent;
 
 /// Protocol version this server implements. Bumped when the wire shape
 /// changes. Tracks the zed-industries/agent-client-protocol spec.
-pub const ACP_PROTOCOL_VERSION: &str = "0.1";
+/// Bumped to "0.2" when Phase 2 (streaming + fan-out) lands.
+pub const ACP_PROTOCOL_VERSION: &str = "0.2";
+
+/// Default broadcast channel capacity (number of events).
+/// Configurable via `CLAW_BROADCAST_CAPACITY` env var.
+pub const DEFAULT_BROADCAST_CAPACITY: usize = 256;
 
 /// Server name advertised via `initialize`.
 pub const ACP_SERVER_NAME: &str = "claw-code";
@@ -68,6 +77,8 @@ pub mod error_codes {
     pub const UNKNOWN_SESSION: i64 = -32001;
     /// ACP-specific: session could not be loaded from the store.
     pub const SESSION_LOAD_FAILED: i64 = -32002;
+    /// ACP-specific: a turn is already in progress for this session.
+    pub const SESSION_BUSY: i64 = -32003;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +95,9 @@ pub enum AcpError {
     Store(String),
     #[error("invalid parameters: {0}")]
     InvalidParams(String),
+    /// A turn is already in progress for this session (SPEC F2.10).
+    #[error("session busy: a turn is already in progress for session {0}")]
+    SessionBusy(String),
 }
 
 impl AcpError {
@@ -94,6 +108,7 @@ impl AcpError {
             Self::UnknownSession(_) => error_codes::UNKNOWN_SESSION,
             Self::Store(_) => error_codes::SESSION_LOAD_FAILED,
             Self::InvalidParams(_) => error_codes::INVALID_PARAMS,
+            Self::SessionBusy(_) => error_codes::SESSION_BUSY,
         }
     }
 }
@@ -161,6 +176,17 @@ impl ServerCapabilities {
             permissions: false,
         }
     }
+
+    /// M3 capabilities: sessions + streaming + tools.
+    #[must_use]
+    pub const fn m3() -> Self {
+        Self {
+            sessions: true,
+            streaming: true,
+            tools: true,
+            permissions: false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +238,31 @@ pub struct CloseSessionParams {
 }
 
 // ---------------------------------------------------------------------------
+// Wire types — session/prompt (M3)
+// ---------------------------------------------------------------------------
+
+/// Parameters for `session/prompt` (SPEC F2.1, DESIGN.md §3).
+///
+/// Returns immediately with `PromptResult`; the actual turn runs async and
+/// pushes `session/update` notifications to all subscribers.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PromptParams {
+    pub session_id: String,
+    /// User text for this turn.
+    pub text: String,
+    /// Optional client-supplied turn id. Generated server-side if omitted.
+    #[serde(default)]
+    pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptResult {
+    pub session_id: String,
+    pub turn_id: String,
+    pub status: &'static str,
+}
+
+// ---------------------------------------------------------------------------
 // Wire types — session/list
 // ---------------------------------------------------------------------------
 
@@ -233,13 +284,39 @@ pub struct SessionSummary {
 
 /// Per-session state owned by the handler.
 ///
-/// Today this is just the `Session` record and its persistence path. M3
-/// attaches a `ConversationRuntime` here so turns can stream tool calls
-/// without the handler reaching into `SessionStore` on every request.
+/// M3 additions (per DESIGN.md §5):
+/// - `broadcast_tx`: fan-out channel for `SessionEvent`s (capacity 256).
+/// - `turn_in_progress`: atomic flag enforcing single-writer invariant (F2.10).
+/// - `next_seq`: monotonic per-session event sequence counter (Design §1, Flag A).
 #[derive(Debug, Clone)]
 pub struct SessionSlot {
     pub session: Session,
     pub path: PathBuf,
+    /// Broadcast sender for `session/update` notifications.
+    /// Subscribers (one per attached client) receive a cloned receiver.
+    pub broadcast_tx: Arc<broadcast::Sender<SessionEvent>>,
+    /// `true` while a TurnDriver task is running for this session.
+    /// Guards the single-writer invariant — `session/prompt` returns
+    /// `SessionBusy` if this is `true`.
+    pub turn_in_progress: Arc<AtomicBool>,
+    /// Monotonic sequence counter. The TurnDriver increments this before
+    /// each `backend.append_event` call. Uses `Ordering::SeqCst` to ensure
+    /// the seq written to storage is consistent with the broadcast order.
+    pub next_seq: Arc<AtomicI32>,
+}
+
+impl SessionSlot {
+    /// Create a new slot, initialising M3 state.
+    pub fn new(session: Session, path: PathBuf, broadcast_capacity: usize) -> Self {
+        let (broadcast_tx, _) = broadcast::channel(broadcast_capacity);
+        Self {
+            session,
+            path,
+            broadcast_tx: Arc::new(broadcast_tx),
+            turn_in_progress: Arc::new(AtomicBool::new(false)),
+            next_seq: Arc::new(AtomicI32::new(0)),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +399,7 @@ impl SessionHandler {
                 name: ACP_SERVER_NAME.to_string(),
                 version: ACP_SERVER_VERSION.to_string(),
             },
-            capabilities: ServerCapabilities::m2(),
+            capabilities: ServerCapabilities::m3(),
         }
     }
 
@@ -348,10 +425,8 @@ impl SessionHandler {
         session = session.with_persistence_path(handle.path.clone());
 
         let session_id = session.session_id.clone();
-        let slot = Arc::new(Mutex::new(SessionSlot {
-            session,
-            path: handle.path,
-        }));
+        let capacity = broadcast_capacity_from_env();
+        let slot = Arc::new(Mutex::new(SessionSlot::new(session, handle.path, capacity)));
 
         {
             let mut guard = self.runtimes.write().await;
@@ -398,10 +473,12 @@ impl SessionHandler {
 
         let message_count = loaded.session.messages.len();
         let session_id = loaded.session.session_id.clone();
-        let slot = Arc::new(Mutex::new(SessionSlot {
-            session: loaded.session,
-            path: loaded.handle.path,
-        }));
+        let capacity = broadcast_capacity_from_env();
+        let slot = Arc::new(Mutex::new(SessionSlot::new(
+            loaded.session,
+            loaded.handle.path,
+            capacity,
+        )));
 
         {
             let mut guard = self.runtimes.write().await;
@@ -485,6 +562,118 @@ impl SessionHandler {
         sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
         ListSessionsResult { sessions }
     }
+
+    /// Start a model turn for the session.
+    ///
+    /// Per SPEC F2.1 and F2.10:
+    /// - Returns `SessionBusy` if a turn is already in progress.
+    /// - Otherwise atomically sets `turn_in_progress = true`, spawns a
+    ///   `TurnDriver` task, and returns immediately with `{status: "started"}`.
+    ///
+    /// The TurnDriver broadcasts `session/update` notifications to all
+    /// subscribers via `broadcast_tx`. Callers must subscribe to the broadcast
+    /// channel (via `subscribe_to_session`) to receive events.
+    pub async fn handle_prompt(&self, params: PromptParams) -> Result<PromptResult, AcpError> {
+        use crate::turn_driver::TurnDriver;
+        use std::sync::atomic::Ordering;
+
+        // Resolve the slot.
+        let slot_arc = {
+            let guard = self.runtimes.read().await;
+            guard
+                .get(&params.session_id)
+                .cloned()
+                .ok_or_else(|| AcpError::UnknownSession(params.session_id.clone()))?
+        };
+
+        // Enforce single-writer invariant (F2.10). Acquire the mutex briefly just
+        // to read the session model, then do the CAS on the atomic flag.
+        let (turn_in_progress, broadcast_tx, next_seq, session_model) = {
+            let slot = slot_arc.lock().await;
+            (
+                Arc::clone(&slot.turn_in_progress),
+                Arc::clone(&slot.broadcast_tx),
+                Arc::clone(&slot.next_seq),
+                slot.session.model.clone(),
+            )
+        };
+
+        // CAS: false → true. If the slot was already true, return SessionBusy.
+        if turn_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(AcpError::SessionBusy(params.session_id.clone()));
+        }
+
+        let turn_id = params
+            .turn_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        tracing::info!(
+            session_id = %params.session_id,
+            turn_id = %turn_id,
+            "starting model turn"
+        );
+
+        let driver = TurnDriver {
+            session_id: params.session_id.clone(),
+            turn_id: turn_id.clone(),
+            text: params.text.clone(),
+            session_model,
+            broadcast_tx,
+            next_seq,
+            turn_in_progress,
+            backend: Arc::clone(&self.backend),
+            slot: slot_arc,
+        };
+
+        tokio::spawn(async move {
+            driver.run().await;
+        });
+
+        Ok(PromptResult {
+            session_id: params.session_id,
+            turn_id,
+            status: "started",
+        })
+    }
+
+    /// Subscribe to broadcast events for a session.
+    ///
+    /// Returns a `broadcast::Receiver` and the current `next_seq` value
+    /// (the sequence number of the LAST event written to storage). Subscribing
+    /// before the DB read is required by the catch-up algorithm (DESIGN.md §6).
+    ///
+    /// Returns `None` if the session is not in the live registry.
+    pub async fn subscribe_to_session(
+        &self,
+        session_id: &str,
+    ) -> Option<(broadcast::Receiver<SessionEvent>, i32)> {
+        use std::sync::atomic::Ordering;
+        let guard = self.runtimes.read().await;
+        let slot_arc = guard.get(session_id)?.clone();
+        drop(guard);
+
+        let slot = slot_arc.lock().await;
+        let rx = slot.broadcast_tx.subscribe();
+        let current_seq = slot.next_seq.load(Ordering::SeqCst);
+        Some((rx, current_seq))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/// Read `CLAW_BROADCAST_CAPACITY` from the environment; fall back to
+/// `DEFAULT_BROADCAST_CAPACITY` (256) if unset or invalid.
+pub fn broadcast_capacity_from_env() -> usize {
+    std::env::var("CLAW_BROADCAST_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_BROADCAST_CAPACITY)
 }
 
 // ---------------------------------------------------------------------------
@@ -532,15 +721,15 @@ mod tests {
             .await;
         assert_eq!(result.protocol_version, ACP_PROTOCOL_VERSION);
         assert_eq!(result.server_info.name, ACP_SERVER_NAME);
-        assert!(result.capabilities.sessions, "M2 must advertise sessions");
+        assert!(result.capabilities.sessions, "M3 must advertise sessions");
         assert!(
-            !result.capabilities.streaming,
-            "streaming lands in M3, not M2"
+            result.capabilities.streaming,
+            "M3 must advertise streaming"
         );
-        assert!(!result.capabilities.tools, "tools land in M3, not M2");
+        assert!(result.capabilities.tools, "M3 must advertise tools");
         assert!(
             !result.capabilities.permissions,
-            "permissions land in M4, not M2"
+            "permissions land in M4, not M3"
         );
     }
 

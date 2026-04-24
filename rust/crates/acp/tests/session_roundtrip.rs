@@ -58,7 +58,9 @@ async fn test_session_roundtrip_initialize_new_list_close_list() {
     assert_eq!(resp["id"], json!(1));
     assert_eq!(resp["result"]["server_info"]["name"], json!("claw-code"));
     assert_eq!(resp["result"]["capabilities"]["sessions"], json!(true));
-    assert_eq!(resp["result"]["capabilities"]["streaming"], json!(false));
+    // M3: streaming is now true (Phase 2 landed).
+    assert_eq!(resp["result"]["capabilities"]["streaming"], json!(true));
+    assert_eq!(resp["result"]["capabilities"]["tools"], json!(true));
 
     // 2. session/new
     client

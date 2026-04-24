@@ -22,13 +22,15 @@ pub mod session;
 pub mod stream;
 pub mod tools;
 pub mod transport;
+pub mod turn_driver;
 
 pub use session::{
     AcpError as SessionError, CloseSessionParams, InitializeParams, InitializeResult,
-    ListSessionsResult, NewSessionParams, NewSessionResult, ResumeSessionParams,
-    ResumeSessionResult, ServerCapabilities, ServerInfo, SessionHandler, SessionSummary,
-    ACP_PROTOCOL_VERSION, ACP_SERVER_NAME, ACP_SERVER_VERSION,
+    ListSessionsResult, NewSessionParams, NewSessionResult, PromptParams, PromptResult,
+    ResumeSessionParams, ResumeSessionResult, ServerCapabilities, ServerInfo, SessionHandler,
+    SessionSummary, ACP_PROTOCOL_VERSION, ACP_SERVER_NAME, ACP_SERVER_VERSION,
 };
+pub use stream::SessionEvent;
 pub use transport::{StdioTransport, Transport, TransportError, WebSocketTransport};
 
 use std::path::PathBuf;
@@ -244,50 +246,220 @@ pub async fn serve_transport<T: Transport>(
     run_dispatch_loop(transport, handler).await
 }
 
-/// Dispatch loop used once M2 is wired. Routes `initialize` and
-/// `session/*` methods to the handler; everything else still returns
-/// JSON-RPC `-32601` until subsequent milestones land.
+/// Dispatch loop — M3 version with broadcast relay.
+///
+/// Handles incoming JSON-RPC requests AND relays `session/update`
+/// notifications from the broadcast channel concurrently using `tokio::select!`.
+///
+/// When a client does `session/resume` or `session/new`, the handler subscribes
+/// to the session's broadcast channel. Subsequent `session/update` notifications
+/// are forwarded from that receiver to the transport without blocking request
+/// processing.
 async fn run_dispatch_loop<T: Transport>(
     mut transport: T,
     handler: Arc<SessionHandler>,
 ) -> Result<(), AcpError> {
+    // Active session_id for this client connection (set on session/resume or session/new).
+    let mut active_session_id: Option<String> = None;
+    // Broadcast receiver for the active session (set when session is attached).
+    let mut broadcast_rx: Option<tokio::sync::broadcast::Receiver<SessionEvent>> = None;
+
     loop {
-        let msg = match transport.recv().await {
-            Ok(Some(msg)) => msg,
-            Ok(None) => {
-                tracing::info!("ACP peer closed transport");
-                transport.close().await.ok();
-                return Ok(());
+        // Decide what to select on: if we have a broadcast receiver, select on both.
+        let event_opt = if let Some(rx) = broadcast_rx.as_mut() {
+            tokio::select! {
+                biased;
+                // Prefer incoming requests (so prompt/close are handled promptly).
+                msg = transport.recv() => {
+                    match msg {
+                        Ok(Some(m)) => Either::Inbound(m),
+                        Ok(None) => {
+                            tracing::info!("ACP peer closed transport");
+                            transport.close().await.ok();
+                            return Ok(());
+                        }
+                        Err(TransportError::Closed) => return Ok(()),
+                        Err(err) => {
+                            tracing::warn!(error = %err, "inbound transport error");
+                            return Err(err.into());
+                        }
+                    }
+                }
+                // Relay broadcast events as session/update notifications.
+                broadcast_result = rx.recv() => {
+                    match broadcast_result {
+                        Ok(ev) => Either::Broadcast(ev),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // Client fell too far behind (F2.6). Send ClientLagged and close.
+                            let lagged = SessionEvent::ClientLagged { dropped: n as usize };
+                            let notif = build_update_notification(
+                                active_session_id.as_deref().unwrap_or(""),
+                                "",
+                                0,
+                                &lagged,
+                            );
+                            transport.send(notif).await.ok();
+                            tracing::warn!(
+                                session_id = ?active_session_id,
+                                dropped = n,
+                                "broadcast receiver lagged — disconnecting client"
+                            );
+                            transport.close().await.ok();
+                            return Ok(());
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // Sender dropped (session closed). Relay is done.
+                            broadcast_rx = None;
+                            continue;
+                        }
+                    }
+                }
             }
-            Err(TransportError::Closed) => return Ok(()),
-            Err(err) => {
-                tracing::warn!(error = %err, "inbound transport error");
-                return Err(err.into());
+        } else {
+            // No broadcast receiver — only handle inbound.
+            match transport.recv().await {
+                Ok(Some(m)) => Either::Inbound(m),
+                Ok(None) => {
+                    tracing::info!("ACP peer closed transport");
+                    transport.close().await.ok();
+                    return Ok(());
+                }
+                Err(TransportError::Closed) => return Ok(()),
+                Err(err) => {
+                    tracing::warn!(error = %err, "inbound transport error");
+                    return Err(err.into());
+                }
             }
         };
 
-        tracing::debug!(?msg, "received ACP message");
+        match event_opt {
+            Either::Broadcast(ev) => {
+                // Extract turn_id and seq from the event for the notification envelope.
+                let turn_id = event_turn_id(&ev);
+                // seq: we don't track per-event seq in the relay — use 0 as sentinel.
+                // The client can use the seq from storage replay; live events are
+                // delivered in order. A proper seq requires querying the backend which
+                // would add latency. TODO: thread seq through broadcast message.
+                let notif = build_update_notification(
+                    active_session_id.as_deref().unwrap_or(""),
+                    &turn_id,
+                    0,
+                    &ev,
+                );
+                if let Err(err) = transport.send(notif).await {
+                    tracing::warn!(error = %err, "failed to relay session/update");
+                    return Err(err.into());
+                }
+            }
+            Either::Inbound(msg) => {
+                tracing::debug!(?msg, "received ACP message");
 
-        // JSON-RPC 2.0: only requests (those carrying an `id`) demand a
-        // reply. Notifications are logged and dropped.
-        let Some(id) = msg.get("id").cloned() else {
-            tracing::debug!("dropping ACP notification (no id)");
-            continue;
-        };
+                // JSON-RPC 2.0: only requests (those carrying an `id`) demand a reply.
+                // Notifications are logged and dropped.
+                let Some(id) = msg.get("id").cloned() else {
+                    tracing::debug!("dropping ACP notification (no id)");
+                    continue;
+                };
 
-        let method = msg
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or("<unknown>")
-            .to_string();
-        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                let method = msg
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>")
+                    .to_string();
+                let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
-        let response = dispatch(handler.as_ref(), &id, &method, params).await;
+                // Handle session/resume and session/new specially so we can subscribe to broadcast.
+                let (response, new_session_id) = dispatch_with_subscription(
+                    handler.as_ref(),
+                    &id,
+                    &method,
+                    params,
+                )
+                .await;
 
-        if let Err(err) = transport.send(response).await {
-            tracing::warn!(error = %err, "failed to send ACP response");
-            return Err(err.into());
+                if let Some(sid) = new_session_id {
+                    // Subscribe to the session's broadcast channel BEFORE any DB read
+                    // (catch-up algorithm step 4 per DESIGN.md §6).
+                    if let Some((rx, hwm)) = handler.subscribe_to_session(&sid).await {
+                        // Perform catch-up replay: load all events from storage.
+                        let stored_events = handler
+                            .backend()
+                            .load_events(&sid, 0)
+                            .await
+                            .unwrap_or_default();
+
+                        // Send stored events to this client (not broadcast).
+                        for ev in &stored_events {
+                            if let Ok(session_ev) =
+                                serde_json::from_value::<SessionEvent>(ev.payload.clone())
+                            {
+                                let turn_id = event_turn_id(&session_ev);
+                                let notif = build_update_notification(
+                                    &sid,
+                                    &turn_id,
+                                    ev.seq,
+                                    &session_ev,
+                                );
+                                if let Err(err) = transport.send(notif).await {
+                                    tracing::warn!(error = %err, "failed to send replay event");
+                                    return Err(err.into());
+                                }
+                            }
+                        }
+
+                        let _ = hwm; // catch-up hwm tracked implicitly by stored_events length
+                        active_session_id = Some(sid);
+                        broadcast_rx = Some(rx);
+                    } else {
+                        active_session_id = Some(sid);
+                    }
+                }
+
+                if let Err(err) = transport.send(response).await {
+                    tracing::warn!(error = %err, "failed to send ACP response");
+                    return Err(err.into());
+                }
+            }
         }
+    }
+}
+
+/// Dispatch result that also carries the subscribed session id when a session
+/// attach method (`session/resume`, `session/new`) is called.
+async fn dispatch_with_subscription(
+    handler: &SessionHandler,
+    id: &Value,
+    method: &str,
+    params: Value,
+) -> (Value, Option<String>) {
+    match method {
+        "session/resume" => match parse_params::<ResumeSessionParams>(params, id) {
+            Ok(p) => {
+                let session_id = p.session_id.clone();
+                match handler.handle_resume(p).await {
+                    Ok(result) => {
+                        let resp =
+                            ok_response(id, serde_json::to_value(result).unwrap_or(Value::Null));
+                        (resp, Some(session_id))
+                    }
+                    Err(err) => (session_error_response(id, &err), None),
+                }
+            }
+            Err(resp) => (resp, None),
+        },
+        "session/new" => match parse_params::<NewSessionParams>(params, id) {
+            Ok(p) => match handler.handle_new(p).await {
+                Ok(result) => {
+                    let session_id = result.session_id.clone();
+                    let resp =
+                        ok_response(id, serde_json::to_value(result).unwrap_or(Value::Null));
+                    (resp, Some(session_id))
+                }
+                Err(err) => (session_error_response(id, &err), None),
+            },
+            Err(resp) => (resp, None),
+        },
+        other => (dispatch(handler, id, other, params).await, None),
     }
 }
 
@@ -332,8 +504,67 @@ async fn dispatch(handler: &SessionHandler, id: &Value, method: &str, params: Va
             let result = handler.handle_list().await;
             ok_response(id, serde_json::to_value(result).unwrap_or(Value::Null))
         }
+        "session/prompt" => match parse_params::<PromptParams>(params, id) {
+            Ok(p) => match handler.handle_prompt(p).await {
+                Ok(result) => ok_response(id, serde_json::to_value(result).unwrap_or(Value::Null)),
+                Err(err) => session_error_response(id, &err),
+            },
+            Err(resp) => resp,
+        },
         other => method_not_found(id, other),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Either discriminant for select! arms
+// ---------------------------------------------------------------------------
+
+enum Either {
+    Inbound(Value),
+    Broadcast(SessionEvent),
+}
+
+// ---------------------------------------------------------------------------
+// Helper: extract turn_id from SessionEvent for notification envelope
+// ---------------------------------------------------------------------------
+
+fn event_turn_id(event: &SessionEvent) -> String {
+    match event {
+        SessionEvent::TextDelta { turn_id, .. }
+        | SessionEvent::ThinkingDelta { turn_id, .. }
+        | SessionEvent::ToolUseStart { turn_id, .. }
+        | SessionEvent::ToolResult { turn_id, .. }
+        | SessionEvent::Usage { turn_id, .. }
+        | SessionEvent::Compaction { turn_id, .. }
+        | SessionEvent::TurnStart { turn_id }
+        | SessionEvent::TurnEnd { turn_id }
+        | SessionEvent::TurnError { turn_id, .. } => turn_id.clone(),
+        SessionEvent::PermissionRequest { .. } | SessionEvent::ClientLagged { .. } => {
+            String::new()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build a session/update notification
+// ---------------------------------------------------------------------------
+
+fn build_update_notification(
+    session_id: &str,
+    turn_id: &str,
+    seq: i32,
+    event: &SessionEvent,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "seq": seq,
+            "event": serde_json::to_value(event).unwrap_or(Value::Null),
+        }
+    })
 }
 
 fn parse_params<P: serde::de::DeserializeOwned>(params: Value, id: &Value) -> Result<P, Value> {
