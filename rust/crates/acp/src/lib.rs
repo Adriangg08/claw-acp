@@ -26,7 +26,8 @@ pub mod turn_driver;
 
 pub use session::{
     AcpError as SessionError, CloseSessionParams, InitializeParams, InitializeResult,
-    ListSessionsResult, NewSessionParams, NewSessionResult, PromptParams, PromptResult,
+    ListSessionsResult, NewSessionParams, NewSessionResult, PendingPermissionRequest,
+    PermissionDecisionStr, PermissionResponseParams, PromptParams, PromptResult,
     ResumeSessionParams, ResumeSessionResult, ServerCapabilities, ServerInfo, SessionHandler,
     SessionSummary, ACP_PROTOCOL_VERSION, ACP_SERVER_NAME, ACP_SERVER_VERSION,
 };
@@ -521,6 +522,16 @@ async fn dispatch(handler: &SessionHandler, id: &Value, method: &str, params: Va
             },
             Err(resp) => resp,
         },
+        // Phase 4 — permission prompt response (SPEC F4.2, DESIGN.md §3).
+        "session/permission_response" => {
+            match parse_params::<PermissionResponseParams>(params, id) {
+                Ok(p) => match handler.handle_permission_response(p).await {
+                    Ok(()) => ok_response(id, json!({"ok": true})),
+                    Err(err) => session_error_response(id, &err),
+                },
+                Err(resp) => resp,
+            }
+        }
         other => method_not_found(id, other),
     }
 }

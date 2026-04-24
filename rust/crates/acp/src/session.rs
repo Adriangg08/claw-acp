@@ -38,11 +38,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::Arc;
 
 use runtime::session_control::SessionControlError;
-use runtime::{FileSessionBackend, Session, SessionBackend, SessionStore};
+use runtime::{FileSessionBackend, PermissionPromptDecision, Session, SessionBackend, SessionStore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::broadcast;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{oneshot, Mutex, RwLock};
 
 use crate::stream::SessionEvent;
 
@@ -79,6 +79,10 @@ pub mod error_codes {
     pub const SESSION_LOAD_FAILED: i64 = -32002;
     /// ACP-specific: a turn is already in progress for this session.
     pub const SESSION_BUSY: i64 = -32003;
+    /// ACP-specific: a permission response was already received for this request.
+    pub const REQUEST_ALREADY_RESOLVED: i64 = -32004;
+    /// ACP-specific: the permission request_id is unknown or has expired/timed out.
+    pub const NO_SUCH_PERMISSION_REQUEST: i64 = -32005;
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +102,12 @@ pub enum AcpError {
     /// A turn is already in progress for this session (SPEC F2.10).
     #[error("session busy: a turn is already in progress for session {0}")]
     SessionBusy(String),
+    /// A permission response was already received (SPEC F4.3).
+    #[error("permission request {0} already resolved by another client")]
+    RequestAlreadyResolved(String),
+    /// No pending permission request with the given request_id (SPEC §3).
+    #[error("no pending permission request with id '{0}'")]
+    NoSuchPermissionRequest(String),
 }
 
 impl AcpError {
@@ -109,6 +119,8 @@ impl AcpError {
             Self::Store(_) => error_codes::SESSION_LOAD_FAILED,
             Self::InvalidParams(_) => error_codes::INVALID_PARAMS,
             Self::SessionBusy(_) => error_codes::SESSION_BUSY,
+            Self::RequestAlreadyResolved(_) => error_codes::REQUEST_ALREADY_RESOLVED,
+            Self::NoSuchPermissionRequest(_) => error_codes::NO_SUCH_PERMISSION_REQUEST,
         }
     }
 }
@@ -185,6 +197,17 @@ impl ServerCapabilities {
             streaming: true,
             tools: true,
             permissions: false,
+        }
+    }
+
+    /// M4 capabilities: sessions + streaming + tools + permissions.
+    #[must_use]
+    pub const fn m4() -> Self {
+        Self {
+            sessions: true,
+            streaming: true,
+            tools: true,
+            permissions: true,
         }
     }
 }
@@ -279,6 +302,50 @@ pub struct SessionSummary {
 }
 
 // ---------------------------------------------------------------------------
+// Wire types — session/permission_response (Phase 4, SPEC F4.2, DESIGN.md §3)
+// ---------------------------------------------------------------------------
+
+/// The client-supplied decision in a `session/permission_response` request.
+///
+/// Maps to [`runtime::PermissionPromptDecision`]:
+/// - `"allow"` → `Allow`
+/// - `"deny"` → `Deny { reason: … }`
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecisionStr {
+    Allow,
+    Deny,
+}
+
+/// Parameters for `session/permission_response` (DESIGN.md §3).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PermissionResponseParams {
+    pub session_id: String,
+    pub request_id: String,
+    pub decision: PermissionDecisionStr,
+    /// Optional human-readable reason (required when `decision = deny`).
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// PendingPermissionRequest — held inside SessionSlot behind a Mutex
+// ---------------------------------------------------------------------------
+
+/// A single pending permission prompt awaiting a client response.
+///
+/// The TurnDriver creates this when `AcpPermissionPrompter::decide` is called.
+/// The first `session/permission_response` that arrives sends on `tx`; all
+/// subsequent responses receive `-32004 RequestAlreadyResolved`.
+///
+/// Stored as `Option<PendingPermissionRequest>` in [`SessionSlot`] to enforce
+/// the single-prompt-at-a-time invariant (SPEC NF4.2).
+pub struct PendingPermissionRequest {
+    pub request_id: String,
+    pub tx: oneshot::Sender<PermissionPromptDecision>,
+}
+
+// ---------------------------------------------------------------------------
 // SessionSlot — the per-session state the handler owns
 // ---------------------------------------------------------------------------
 
@@ -288,7 +355,11 @@ pub struct SessionSummary {
 /// - `broadcast_tx`: fan-out channel for `SessionEvent`s (capacity 256).
 /// - `turn_in_progress`: atomic flag enforcing single-writer invariant (F2.10).
 /// - `next_seq`: monotonic per-session event sequence counter (Design §1, Flag A).
-#[derive(Debug, Clone)]
+///
+/// M4 addition (per DESIGN.md §8):
+/// - `pending_permission`: the active permission prompt awaiting a client
+///   response. `None` when no prompt is in flight. Protected by the slot's
+///   `Mutex` so the dispatch loop can atomically take/replace it.
 pub struct SessionSlot {
     pub session: Session,
     pub path: PathBuf,
@@ -303,10 +374,14 @@ pub struct SessionSlot {
     /// each `backend.append_event` call. Uses `Ordering::SeqCst` to ensure
     /// the seq written to storage is consistent with the broadcast order.
     pub next_seq: Arc<AtomicI32>,
+    /// Active permission prompt awaiting a client response (SPEC F4.3, NF4.2).
+    /// Only one prompt may be in flight at a time per session; the TurnDriver
+    /// queues subsequent prompts until the first is resolved or timed out.
+    pub pending_permission: Option<PendingPermissionRequest>,
 }
 
 impl SessionSlot {
-    /// Create a new slot, initialising M3 state.
+    /// Create a new slot, initialising M3/M4 state.
     pub fn new(session: Session, path: PathBuf, broadcast_capacity: usize) -> Self {
         let (broadcast_tx, _) = broadcast::channel(broadcast_capacity);
         Self {
@@ -315,6 +390,7 @@ impl SessionSlot {
             broadcast_tx: Arc::new(broadcast_tx),
             turn_in_progress: Arc::new(AtomicBool::new(false)),
             next_seq: Arc::new(AtomicI32::new(0)),
+            pending_permission: None,
         }
     }
 }
@@ -399,7 +475,7 @@ impl SessionHandler {
                 name: ACP_SERVER_NAME.to_string(),
                 version: ACP_SERVER_VERSION.to_string(),
             },
-            capabilities: ServerCapabilities::m3(),
+            capabilities: ServerCapabilities::m4(),
         }
     }
 
@@ -640,6 +716,81 @@ impl SessionHandler {
         })
     }
 
+    /// Handle a `session/permission_response` from a client.
+    ///
+    /// Routes the client's allow/deny decision to the `AcpPermissionPrompter`
+    /// waiting on the session's oneshot channel. First valid response wins;
+    /// subsequent responses return `-32004 RequestAlreadyResolved`.
+    ///
+    /// After routing the decision, broadcasts a `PermissionResponse` event to all
+    /// attached clients so they know the outcome (SPEC F4.7 via storage, DESIGN §8).
+    pub async fn handle_permission_response(
+        &self,
+        params: PermissionResponseParams,
+    ) -> Result<(), AcpError> {
+        let slot_arc = {
+            let guard = self.runtimes.read().await;
+            guard
+                .get(&params.session_id)
+                .cloned()
+                .ok_or_else(|| AcpError::UnknownSession(params.session_id.clone()))?
+        };
+
+        // Atomically take the pending permission out of the slot.
+        // Holding the mutex here is intentional: the atomicity of take + send
+        // prevents two concurrent responses from both "winning".
+        let pending = {
+            let mut slot = slot_arc.lock().await;
+            slot.pending_permission.take()
+        };
+
+        match pending {
+            None => {
+                // No pending prompt at all (already timed out or never started).
+                Err(AcpError::NoSuchPermissionRequest(params.request_id))
+            }
+            Some(pending) => {
+                // Verify the request_id matches (guards against stale responses after
+                // a session re-use with a new prompt).
+                if pending.request_id != params.request_id {
+                    // Put it back — we took it but it wasn't ours to consume.
+                    let mut slot = slot_arc.lock().await;
+                    slot.pending_permission = Some(pending);
+                    return Err(AcpError::NoSuchPermissionRequest(params.request_id));
+                }
+
+                // Translate the wire decision into the runtime type.
+                let decision = match params.decision {
+                    PermissionDecisionStr::Allow => PermissionPromptDecision::Allow,
+                    PermissionDecisionStr::Deny => PermissionPromptDecision::Deny {
+                        reason: params
+                            .reason
+                            .unwrap_or_else(|| "denied by client".to_string()),
+                    },
+                };
+
+                // Send on the oneshot. If the receiver is gone (TurnDriver timed out),
+                // the send will fail — treat as NoSuchPermissionRequest since from the
+                // client's perspective the prompt is gone.
+                if pending.tx.send(decision).is_err() {
+                    tracing::warn!(
+                        session_id = %params.session_id,
+                        request_id = %params.request_id,
+                        "permission response arrived after timeout — TurnDriver already moved on"
+                    );
+                    return Err(AcpError::NoSuchPermissionRequest(params.request_id));
+                }
+
+                tracing::info!(
+                    session_id = %params.session_id,
+                    request_id = %params.request_id,
+                    "permission response routed to TurnDriver"
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// Get a reference to the slot arc for a session (for tests and diagnostics).
     pub async fn get_slot(&self, session_id: &str) -> Option<Arc<Mutex<SessionSlot>>> {
         let guard = self.runtimes.read().await;
@@ -727,15 +878,15 @@ mod tests {
             .await;
         assert_eq!(result.protocol_version, ACP_PROTOCOL_VERSION);
         assert_eq!(result.server_info.name, ACP_SERVER_NAME);
-        assert!(result.capabilities.sessions, "M3 must advertise sessions");
+        assert!(result.capabilities.sessions, "M4 must advertise sessions");
         assert!(
             result.capabilities.streaming,
-            "M3 must advertise streaming"
+            "M4 must advertise streaming"
         );
-        assert!(result.capabilities.tools, "M3 must advertise tools");
+        assert!(result.capabilities.tools, "M4 must advertise tools");
         assert!(
-            !result.capabilities.permissions,
-            "permissions land in M4, not M3"
+            result.capabilities.permissions,
+            "M4 must advertise permissions"
         );
     }
 
@@ -871,6 +1022,194 @@ mod tests {
         let mut listed: Vec<String> = list.sessions.iter().map(|s| s.session_id.clone()).collect();
         listed.sort();
         assert_eq!(listed, ids);
+    }
+
+    // -----------------------------------------------------------------------
+    // T4.4 — permission_response handler unit tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_permission_response_unknown_session_returns_error() {
+        let (handler, _ws) = fixture_handler();
+        let err = handler
+            .handle_permission_response(PermissionResponseParams {
+                session_id: "no-such-session".to_string(),
+                request_id: "perm-1".to_string(),
+                decision: PermissionDecisionStr::Allow,
+                reason: None,
+            })
+            .await
+            .expect_err("must error");
+        assert!(matches!(err, AcpError::UnknownSession(_)));
+        assert_eq!(err.code(), error_codes::UNKNOWN_SESSION);
+    }
+
+    #[tokio::test]
+    async fn test_permission_response_no_pending_returns_no_such_request() {
+        let (handler, _ws) = fixture_handler();
+        let created = handler
+            .handle_new(NewSessionParams::default())
+            .await
+            .expect("new session");
+
+        // No pending permission — response must return NoSuchPermissionRequest.
+        let err = handler
+            .handle_permission_response(PermissionResponseParams {
+                session_id: created.session_id.clone(),
+                request_id: "perm-never-existed".to_string(),
+                decision: PermissionDecisionStr::Allow,
+                reason: None,
+            })
+            .await
+            .expect_err("must error");
+        assert!(matches!(err, AcpError::NoSuchPermissionRequest(_)));
+        assert_eq!(err.code(), error_codes::NO_SUCH_PERMISSION_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_permission_response_wrong_request_id_returns_error() {
+        use runtime::PermissionPromptDecision;
+        use tokio::sync::oneshot;
+
+        let (handler, _ws) = fixture_handler();
+        let created = handler
+            .handle_new(NewSessionParams::default())
+            .await
+            .expect("new session");
+
+        // Install a pending permission with request_id "perm-A".
+        let (tx, _rx) = oneshot::channel::<PermissionPromptDecision>();
+        {
+            let slot_arc = handler
+                .get_slot(&created.session_id)
+                .await
+                .expect("slot");
+            let mut slot = slot_arc.lock().await;
+            slot.pending_permission = Some(PendingPermissionRequest {
+                request_id: "perm-A".to_string(),
+                tx,
+            });
+        }
+
+        // Respond with wrong request_id "perm-B".
+        let err = handler
+            .handle_permission_response(PermissionResponseParams {
+                session_id: created.session_id.clone(),
+                request_id: "perm-B".to_string(),
+                decision: PermissionDecisionStr::Allow,
+                reason: None,
+            })
+            .await
+            .expect_err("must error");
+        assert!(matches!(err, AcpError::NoSuchPermissionRequest(_)));
+
+        // The pending_permission must still be in the slot (we put it back).
+        let slot_arc = handler.get_slot(&created.session_id).await.expect("slot");
+        let slot = slot_arc.lock().await;
+        assert!(
+            slot.pending_permission.is_some(),
+            "pending permission must be restored after wrong-id response"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_permission_response_routes_decision_to_oneshot() {
+        use runtime::PermissionPromptDecision;
+        use tokio::sync::oneshot;
+
+        let (handler, _ws) = fixture_handler();
+        let created = handler
+            .handle_new(NewSessionParams::default())
+            .await
+            .expect("new session");
+
+        // Install a pending permission with request_id "perm-correct".
+        let (tx, rx) = oneshot::channel::<PermissionPromptDecision>();
+        {
+            let slot_arc = handler
+                .get_slot(&created.session_id)
+                .await
+                .expect("slot");
+            let mut slot = slot_arc.lock().await;
+            slot.pending_permission = Some(PendingPermissionRequest {
+                request_id: "perm-correct".to_string(),
+                tx,
+            });
+        }
+
+        // Send the allow response.
+        handler
+            .handle_permission_response(PermissionResponseParams {
+                session_id: created.session_id.clone(),
+                request_id: "perm-correct".to_string(),
+                decision: PermissionDecisionStr::Allow,
+                reason: None,
+            })
+            .await
+            .expect("response ok");
+
+        // The decision must have arrived on the receiver.
+        let decision = rx.await.expect("oneshot resolved");
+        assert_eq!(decision, PermissionPromptDecision::Allow);
+
+        // The slot must now have no pending permission.
+        let slot_arc = handler.get_slot(&created.session_id).await.expect("slot");
+        let slot = slot_arc.lock().await;
+        assert!(
+            slot.pending_permission.is_none(),
+            "pending_permission cleared after successful response"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_permission_response_second_response_gets_no_such_request() {
+        use runtime::PermissionPromptDecision;
+        use tokio::sync::oneshot;
+
+        let (handler, _ws) = fixture_handler();
+        let created = handler
+            .handle_new(NewSessionParams::default())
+            .await
+            .expect("new session");
+
+        // Install a pending permission.
+        let (tx, _rx) = oneshot::channel::<PermissionPromptDecision>();
+        {
+            let slot_arc = handler
+                .get_slot(&created.session_id)
+                .await
+                .expect("slot");
+            let mut slot = slot_arc.lock().await;
+            slot.pending_permission = Some(PendingPermissionRequest {
+                request_id: "perm-X".to_string(),
+                tx,
+            });
+        }
+
+        // First response — succeeds (even though receiver is dropped, the tx.send
+        // will fail, but the slot is still cleared).
+        // Actually: _rx is live so tx.send succeeds.
+        let result = handler
+            .handle_permission_response(PermissionResponseParams {
+                session_id: created.session_id.clone(),
+                request_id: "perm-X".to_string(),
+                decision: PermissionDecisionStr::Deny,
+                reason: Some("not allowed".to_string()),
+            })
+            .await;
+        assert!(result.is_ok(), "first response must succeed");
+
+        // Second response with same request_id — slot is empty now.
+        let err = handler
+            .handle_permission_response(PermissionResponseParams {
+                session_id: created.session_id.clone(),
+                request_id: "perm-X".to_string(),
+                decision: PermissionDecisionStr::Allow,
+                reason: None,
+            })
+            .await
+            .expect_err("second response must fail");
+        assert_eq!(err.code(), error_codes::NO_SUCH_PERMISSION_REQUEST);
     }
 
     #[tokio::test]

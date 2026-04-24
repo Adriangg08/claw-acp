@@ -437,6 +437,7 @@ mod tests {
             broadcast_tx: Arc::clone(&broadcast_tx),
             turn_in_progress: Arc::clone(&turn_in_progress),
             next_seq: Arc::clone(&next_seq),
+            pending_permission: None,
         }));
 
         let driver = TurnDriver {
