@@ -45,6 +45,7 @@ use tokio::sync::broadcast;
 use tokio::sync::{oneshot, Mutex, RwLock};
 
 use crate::stream::SessionEvent;
+use crate::turn_driver::{StubTurnExecutorFactory, TurnExecutorFactory};
 
 /// Protocol version this server implements. Bumped when the wire shape
 /// changes. Tracks the zed-industries/agent-client-protocol spec.
@@ -412,13 +413,21 @@ pub struct SessionHandler {
     /// Pluggable storage backend (file or Postgres) selected via
     /// `CLAW_SESSION_BACKEND`. See DESIGN.md §2 and SPEC.md F1.4.
     backend: Arc<dyn SessionBackend>,
+    /// Factory that builds and runs `ConversationRuntime` for each turn.
+    ///
+    /// Injected by `acp::serve()`. Defaults to `StubTurnExecutorFactory`
+    /// (emits a canned "not wired" response) when not explicitly provided.
+    /// The CLI passes `CliTurnExecutorFactory` to get real LLM execution.
+    executor_factory: Arc<dyn TurnExecutorFactory>,
 }
 
 impl SessionHandler {
     /// Build a new handler backed by `store` using the file backend.
     ///
-    /// Preserved for backward compatibility and tests. Production paths call
-    /// [`Self::new_with_backend`] after backend selection.
+    /// Uses `StubTurnExecutorFactory` — suitable for tests and code-paths
+    /// that only need session lifecycle (no LLM execution). Production paths
+    /// that need real model execution call [`Self::new_with_backend`] and
+    /// supply a factory via [`Self::with_executor_factory`].
     #[must_use]
     pub fn new(store: SessionStore) -> Self {
         let backend = Arc::new(FileSessionBackend::new(store.clone()));
@@ -426,19 +435,33 @@ impl SessionHandler {
             runtimes: RwLock::new(HashMap::new()),
             store,
             backend,
+            executor_factory: Arc::new(StubTurnExecutorFactory),
         }
     }
 
     /// Build a new handler with an explicit [`SessionBackend`].
     ///
     /// Called by `serve()` after `build_session_backend()` resolves the env var.
+    /// Uses `StubTurnExecutorFactory` by default; call
+    /// [`Self::with_executor_factory`] to wire in the real CLI factory.
     #[must_use]
     pub fn new_with_backend(store: SessionStore, backend: Arc<dyn SessionBackend>) -> Self {
         Self {
             runtimes: RwLock::new(HashMap::new()),
             store,
             backend,
+            executor_factory: Arc::new(StubTurnExecutorFactory),
         }
+    }
+
+    /// Replace the turn executor factory.
+    ///
+    /// Called immediately after construction by `acp::serve()` when a real
+    /// `CliTurnExecutorFactory` is available.
+    #[must_use]
+    pub fn with_executor_factory(mut self, factory: Arc<dyn TurnExecutorFactory>) -> Self {
+        self.executor_factory = factory;
+        self
     }
 
     /// Expose the bound store — useful for tests and for higher-level
@@ -703,6 +726,7 @@ impl SessionHandler {
             turn_in_progress,
             backend: Arc::clone(&self.backend),
             slot: slot_arc,
+            executor_factory: Arc::clone(&self.executor_factory),
         };
 
         tokio::spawn(async move {

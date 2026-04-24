@@ -32,7 +32,9 @@ pub use session::{
     SessionSummary, ACP_PROTOCOL_VERSION, ACP_SERVER_NAME, ACP_SERVER_VERSION,
 };
 pub use stream::SessionEvent;
+pub use tools::AcpPermissionPrompter;
 pub use transport::{StdioTransport, Transport, TransportError, WebSocketTransport};
+pub use turn_driver::{turn_summary_to_events, StubTurnExecutorFactory, TurnExecutorFactory};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -97,25 +99,40 @@ pub enum AcpError {
 /// Launch the ACP server with the given options.
 ///
 /// Blocks the current task until the transport closes or an unrecoverable
-/// error occurs. M2 wires a [`SessionHandler`] into the dispatch loop so
-/// `initialize` and `session/*` calls are answered with real semantics;
-/// tool execution (M3) and permissions (M4) still return a structured
-/// JSON-RPC `-32601` error.
+/// error occurs.
 ///
-/// Backend is selected via `CLAW_SESSION_BACKEND`:
+/// # `executor_factory`
+///
+/// The factory is called once per `session/prompt` request to run the actual
+/// LLM turn inside a `spawn_blocking` thread.  Pass
+/// [`StubTurnExecutorFactory`] (or `None` — the default) for tests and
+/// environments where no real model should be invoked.  The CLI binary passes
+/// its own `CliTurnExecutorFactory` that wires `AnthropicRuntimeClient` +
+/// `CliToolExecutor` + `AcpPermissionPrompter`.
+///
+/// # Backend
+///
+/// Selected via `CLAW_SESSION_BACKEND`:
 /// - `file` (default) — existing JSONL behavior, no Postgres dependency.
 /// - `postgres` — requires `CLAW_PG_URL` or `DATABASE_URL` to be set.
 ///
 /// This is the single integration point used by `rusty-claude-cli` so the
 /// CLI does not need to depend on internal module layout.
-pub async fn serve(options: ServeOptions) -> Result<(), AcpError> {
+pub async fn serve(
+    options: ServeOptions,
+    executor_factory: Option<Arc<dyn TurnExecutorFactory>>,
+) -> Result<(), AcpError> {
+    let factory = executor_factory.unwrap_or_else(|| Arc::new(StubTurnExecutorFactory));
     match options {
         ServeOptions::Stdio {
             workspace_root,
             data_dir,
         } => {
             let (store, backend) = build_session_backend(workspace_root, data_dir).await?;
-            let handler = Arc::new(SessionHandler::new_with_backend(store, backend));
+            let handler = Arc::new(
+                SessionHandler::new_with_backend(store, backend)
+                    .with_executor_factory(Arc::clone(&factory)),
+            );
             tracing::info!("ACP server listening on stdio (Content-Length framing)");
             let transport = StdioTransport::new();
             run_dispatch_loop(transport, handler).await
@@ -128,7 +145,10 @@ pub async fn serve(options: ServeOptions) -> Result<(), AcpError> {
             let (store, backend) = build_session_backend(workspace_root, data_dir).await?;
             // Share one handler across all websocket sessions so `session/list`
             // reflects every connected client in this process.
-            let handler = Arc::new(SessionHandler::new_with_backend(store, backend));
+            let handler = Arc::new(
+                SessionHandler::new_with_backend(store, backend)
+                    .with_executor_factory(Arc::clone(&factory)),
+            );
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             let bound = listener.local_addr()?;
             tracing::info!(%bound, "ACP server listening on websocket");
@@ -235,11 +255,16 @@ fn build_session_store(
     Ok(store)
 }
 
-/// Drive the M2 dispatch loop against an arbitrary transport.
+/// Drive the dispatch loop against an arbitrary transport.
 ///
 /// Public so integration tests can drive the server over `duplex`
 /// streams without touching the real stdio handles. Production callers
 /// go through [`serve`].
+///
+/// The handler must already have an executor factory configured (via
+/// [`SessionHandler::with_executor_factory`]) if real model execution
+/// is needed. For tests, the default `StubTurnExecutorFactory` is used
+/// when the handler is built with [`SessionHandler::new`].
 pub async fn serve_transport<T: Transport>(
     transport: T,
     handler: Arc<SessionHandler>,

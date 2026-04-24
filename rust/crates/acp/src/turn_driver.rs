@@ -25,24 +25,108 @@
 //!
 //! Delta-level streaming (token-by-token text) requires refactoring
 //! `ConversationRuntime` to expose an event channel during `run_turn`.  That
-//! is deferred to Phase 2.5 (see `docs/acp-m3/blockers/phase-2-streaming.md`).
+//! is deferred to a future phase (see `docs/acp-m3/blockers/phase-2-streaming.md`).
 //!
 //! # Write-before-broadcast invariant
 //!
 //! Per DESIGN.md §5: each event is written to the backend BEFORE it is sent on
 //! `broadcast_tx`.  This guarantees that a client attaching mid-turn can
 //! replay all events from storage without gaps.
+//!
+//! # TurnExecutorFactory — dependency injection for real model execution
+//!
+//! `ConversationRuntime<C, T>` is generic over concrete `ApiClient` and
+//! `ToolExecutor` types that live in `rusty-claude-cli`. Adding that crate as
+//! a dependency of `acp` would create a cyclic dependency (`rusty-claude-cli`
+//! → `acp` → `rusty-claude-cli`). The clean solution is a trait:
+//!
+//! ```text
+//! acp::TurnExecutorFactory  ←  implemented by CliTurnExecutorFactory
+//!                                               (in rusty-claude-cli)
+//! ```
+//!
+//! At daemon startup `rusty-claude-cli` constructs a `CliTurnExecutorFactory`
+//! and passes it into `acp::serve()`. The `SessionHandler` stores it as
+//! `Arc<dyn TurnExecutorFactory>` and threads it into each `TurnDriver`.
+//!
+//! Tests and the fallback path use `StubTurnExecutorFactory`, which emits a
+//! canned text response — identical to the old stub behaviour.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 
 use runtime::session_control::{StoredEvent, StoredEventType};
-use runtime::{Session, SessionBackend};
+use runtime::{ContentBlock, Session, SessionBackend, TurnSummary};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 
 use crate::session::SessionSlot;
 use crate::stream::SessionEvent;
+
+// ---------------------------------------------------------------------------
+// TurnExecutorFactory — DI trait
+// ---------------------------------------------------------------------------
+
+/// Runs a single model turn synchronously and returns [`SessionEvent`]s.
+///
+/// Implementors run in `tokio::task::spawn_blocking`; they MUST NOT call
+/// async code directly. The Tokio runtime handle is available for
+/// `Handle::block_on` calls (e.g. inside `AcpPermissionPrompter::decide`).
+///
+/// # Contract
+///
+/// - Called once per `session/prompt` request, on a blocking thread.
+/// - Must be `Send + Sync + 'static` so the `Arc` can cross async task
+///   boundaries safely.
+/// - On success, returns a `Vec<SessionEvent>` in emission order (excluding
+///   `TurnStart` and `TurnEnd`, which the `TurnDriver` emits itself).
+/// - On error, returns an error string. `TurnDriver` maps this to a
+///   `TurnError` event.
+pub trait TurnExecutorFactory: Send + Sync + 'static {
+    /// Execute one model turn.
+    ///
+    /// `session` is a snapshot of the current [`Session`] — the factory owns
+    /// it exclusively for the duration of the call.  `slot` is needed by
+    /// `AcpPermissionPrompter` so it can install permission oneshots.
+    fn execute(
+        &self,
+        session: Session,
+        user_input: String,
+        turn_id: String,
+        slot: Arc<Mutex<SessionSlot>>,
+        handle: tokio::runtime::Handle,
+    ) -> Result<Vec<SessionEvent>, String>;
+}
+
+// ---------------------------------------------------------------------------
+// StubTurnExecutorFactory — fallback / test executor
+// ---------------------------------------------------------------------------
+
+/// Emits a single [`SessionEvent::TextDelta`] with a message explaining the
+/// factory was not wired. Identical to the old stub behaviour.
+///
+/// Used by:
+/// - Integration tests that only need to exercise the broadcast/persistence
+///   machinery without invoking a real model.
+/// - Any future code-path that hasn't had a factory injected.
+pub struct StubTurnExecutorFactory;
+
+impl TurnExecutorFactory for StubTurnExecutorFactory {
+    fn execute(
+        &self,
+        _session: Session,
+        _user_input: String,
+        turn_id: String,
+        _slot: Arc<Mutex<SessionSlot>>,
+        _handle: tokio::runtime::Handle,
+    ) -> Result<Vec<SessionEvent>, String> {
+        Ok(vec![SessionEvent::TextDelta {
+            turn_id,
+            text: "[ACP stub: TurnExecutorFactory not wired — pass a real factory to acp::serve()]"
+                .to_string(),
+        }])
+    }
+}
 
 // ---------------------------------------------------------------------------
 // TurnDriver
@@ -60,6 +144,10 @@ pub struct TurnDriver {
     pub turn_in_progress: Arc<AtomicBool>,
     pub backend: Arc<dyn SessionBackend>,
     pub slot: Arc<Mutex<SessionSlot>>,
+    /// Factory that builds and runs `ConversationRuntime` for this turn.
+    /// Injected by `SessionHandler::handle_prompt` from the factory stored in
+    /// the handler.
+    pub executor_factory: Arc<dyn TurnExecutorFactory>,
 }
 
 impl TurnDriver {
@@ -97,19 +185,18 @@ impl TurnDriver {
 
         let text = self.text.clone();
         let turn_id = self.turn_id.clone();
+        let slot = Arc::clone(&self.slot);
+        let factory = Arc::clone(&self.executor_factory);
 
         // Run the synchronous ConversationRuntime in a blocking thread.
         // Flag D verified: run_turn is sync and MUST run in spawn_blocking.
         //
-        // The TurnDriver uses a NoOpApiClient + StaticToolExecutor stub
-        // because the ACP layer doesn't have access to the concrete ApiClient
-        // and ToolExecutor types at this layer.  The session is provided as
-        // a pre-loaded snapshot; the runtime will mutate its internal copy.
-        //
-        // BLOCKER: Until the concrete ApiClient/ToolExecutor are wired here,
-        // the TurnDriver emits a stub turn. See docs/acp-m3/blockers/phase-2-streaming.md.
+        // The TurnExecutorFactory trait lets the CLI inject a real
+        // ConversationRuntime (AnthropicRuntimeClient + CliToolExecutor +
+        // AcpPermissionPrompter) without creating a cyclic crate dependency.
+        let handle = tokio::runtime::Handle::current();
         let turn_result = tokio::task::spawn_blocking(move || {
-            run_turn_sync(session, text, turn_id)
+            factory.execute(session, text, turn_id, slot, handle)
         })
         .await
         .map_err(|join_err| format!("TurnDriver task panicked: {join_err}"))?;
@@ -179,31 +266,106 @@ impl TurnDriver {
 }
 
 // ---------------------------------------------------------------------------
-// Stub synchronous turn execution
+// TurnSummary → Vec<SessionEvent> conversion
 // ---------------------------------------------------------------------------
-// NOTE: This is the turn-level stub that runs in spawn_blocking.
-// It uses the Session snapshot but cannot invoke the real ConversationRuntime
-// because that requires generic ApiClient + ToolExecutor parameters that are
-// not available at the acp-crate layer.
-//
-// Resolution path: the CLI integration will wire a concrete TurnDriver
-// via a callback closure or a boxed trait. See the blocker doc for details.
-//
-// For now the stub emits a synthetic "not yet wired" response so the
-// protocol plumbing (broadcast, catch-up, persistence) can be exercised
-// by integration tests using mock drivers.
-fn run_turn_sync(
-    _session: Session,
-    _text: String,
-    turn_id: String,
-) -> Result<Vec<SessionEvent>, String> {
-    // Stub: emit a single TextDelta explaining the situation.
-    // Tests override this by injecting events via a `MockTurnSource`.
-    Ok(vec![SessionEvent::TextDelta {
-        turn_id,
-        text: "[ACP stub: ConversationRuntime not wired at this layer — see phase-2-streaming.md]"
-            .to_string(),
-    }])
+
+/// Convert a completed [`TurnSummary`] into the ordered sequence of
+/// [`SessionEvent`]s that the TurnDriver should emit.
+///
+/// Conversion rules (turn-level, not delta-level):
+/// - Each `ContentBlock::Text` → `TextDelta`
+/// - Each `ContentBlock::Thinking` → `ThinkingDelta`
+/// - Each `ContentBlock::ToolUse` in an assistant message → `ToolUseStart`;
+///   the matching `ToolResult` is found in `tool_results` messages.
+/// - Usage from the summary → `Usage` (emitted once at the end of the event list).
+/// - Auto-compaction → `Compaction` (emitted before `Usage` if present).
+///
+/// `TurnStart` and `TurnEnd` are NOT included — the `TurnDriver` emits those.
+pub fn turn_summary_to_events(turn_id: &str, summary: &TurnSummary) -> Vec<SessionEvent> {
+    let mut events = Vec::new();
+
+    // Walk assistant messages and their paired tool results.
+    // The runtime pairs them: for each assistant message with ToolUse blocks,
+    // there is a corresponding tool-result message in `tool_results`.
+    let mut tool_result_iter = summary.tool_results.iter();
+
+    for assistant_msg in &summary.assistant_messages {
+        let mut has_tool_uses = false;
+
+        for block in &assistant_msg.blocks {
+            match block {
+                ContentBlock::Text { text } if !text.is_empty() => {
+                    events.push(SessionEvent::TextDelta {
+                        turn_id: turn_id.to_string(),
+                        text: text.clone(),
+                    });
+                }
+                ContentBlock::Thinking { reasoning } if !reasoning.is_empty() => {
+                    events.push(SessionEvent::ThinkingDelta {
+                        turn_id: turn_id.to_string(),
+                        text: reasoning.clone(),
+                    });
+                }
+                ContentBlock::ToolUse { id, name, input } => {
+                    has_tool_uses = true;
+                    events.push(SessionEvent::ToolUseStart {
+                        turn_id: turn_id.to_string(),
+                        tool_use_id: id.clone(),
+                        tool_name: name.clone(),
+                        input: input.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // If this assistant message had tool uses, emit the matching ToolResult(s).
+        if has_tool_uses {
+            if let Some(result_msg) = tool_result_iter.next() {
+                for block in &result_msg.blocks {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        tool_name,
+                        output,
+                        is_error,
+                    } = block
+                    {
+                        events.push(SessionEvent::ToolResult {
+                            turn_id: turn_id.to_string(),
+                            tool_use_id: tool_use_id.clone(),
+                            tool_name: tool_name.clone(),
+                            output: output.clone(),
+                            is_error: *is_error,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Compaction (if auto-compaction fired during this turn).
+    if let Some(compaction) = &summary.auto_compaction {
+        events.push(SessionEvent::Compaction {
+            turn_id: turn_id.to_string(),
+            summary: format!(
+                "Auto-compacted: {} messages removed",
+                compaction.removed_message_count
+            ),
+            removed_message_count: compaction.removed_message_count,
+        });
+    }
+
+    // Usage (always emitted at end, one event per turn).
+    let usage = &summary.usage;
+    events.push(SessionEvent::Usage {
+        turn_id: turn_id.to_string(),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+    });
+
+    events
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +580,10 @@ mod tests {
     // Tests
     // -----------------------------------------------------------------------
 
+    fn stub_factory() -> Arc<dyn TurnExecutorFactory> {
+        Arc::new(StubTurnExecutorFactory)
+    }
+
     #[tokio::test]
     async fn turn_driver_sets_turn_in_progress_false_on_completion() {
         let dir = TempDir::new().unwrap();
@@ -450,6 +616,7 @@ mod tests {
             turn_in_progress: Arc::clone(&turn_in_progress),
             backend: Arc::clone(&backend),
             slot,
+            executor_factory: stub_factory(),
         };
 
         driver.run().await;
@@ -581,5 +748,108 @@ mod tests {
                 .unwrap();
             assert!(!stored.is_empty());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // turn_summary_to_events tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summary_to_events_text_only() {
+        use runtime::{
+            ContentBlock, ConversationMessage, MessageRole, TokenUsage, TurnSummary,
+        };
+
+        let summary = TurnSummary {
+            assistant_messages: vec![ConversationMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![ContentBlock::Text {
+                    text: "Hello!".to_string(),
+                }],
+                usage: None,
+            }],
+            tool_results: vec![],
+            prompt_cache_events: vec![],
+            iterations: 1,
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+            auto_compaction: None,
+        };
+
+        let events = turn_summary_to_events("turn-1", &summary);
+        assert_eq!(events.len(), 2, "TextDelta + Usage");
+        assert!(matches!(events[0], SessionEvent::TextDelta { ref text, .. } if text == "Hello!"));
+        assert!(matches!(events[1], SessionEvent::Usage { input_tokens: 10, .. }));
+    }
+
+    #[test]
+    fn summary_to_events_with_tool_use() {
+        use runtime::{
+            ContentBlock, ConversationMessage, MessageRole, TokenUsage, TurnSummary,
+        };
+
+        let summary = TurnSummary {
+            assistant_messages: vec![ConversationMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "Bash".to_string(),
+                    input: r#"{"command":"ls"}"#.to_string(),
+                }],
+                usage: None,
+            }],
+            tool_results: vec![ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool-1".to_string(),
+                    tool_name: "Bash".to_string(),
+                    output: "file.txt".to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            }],
+            prompt_cache_events: vec![],
+            iterations: 1,
+            usage: TokenUsage {
+                input_tokens: 20,
+                output_tokens: 10,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+            auto_compaction: None,
+        };
+
+        let events = turn_summary_to_events("turn-2", &summary);
+        // ToolUseStart + ToolResult + Usage
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], SessionEvent::ToolUseStart { ref tool_name, .. } if tool_name == "Bash"));
+        assert!(matches!(events[1], SessionEvent::ToolResult { ref tool_name, .. } if tool_name == "Bash"));
+        assert!(matches!(events[2], SessionEvent::Usage { .. }));
+    }
+
+    #[test]
+    fn summary_to_events_with_dummy_factory() {
+        // Verify DummyTurnExecutorFactory produces events that can be converted.
+        let factory = StubTurnExecutorFactory;
+        let session = Session::new();
+        let slot = Arc::new(Mutex::new(SessionSlot {
+            session: session.clone(),
+            path: std::path::PathBuf::from("/tmp"),
+            broadcast_tx: Arc::new(broadcast::channel(1).0),
+            turn_in_progress: Arc::new(AtomicBool::new(false)),
+            next_seq: Arc::new(AtomicI32::new(0)),
+            pending_permission: None,
+        }));
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
+        let events = factory
+            .execute(session, "hello".to_string(), "t".to_string(), slot, handle)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SessionEvent::TextDelta { .. }));
     }
 }

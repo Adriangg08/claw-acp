@@ -5967,20 +5967,148 @@ fn print_help_topic(topic: LocalHelpTopic) {
     println!("{}", render_help_topic(topic));
 }
 
+// ---------------------------------------------------------------------------
+// CliTurnExecutorFactory — wires the real ConversationRuntime into TurnDriver
+// ---------------------------------------------------------------------------
+
+/// Implements [`acp::TurnExecutorFactory`] using the CLI's concrete
+/// `AnthropicRuntimeClient` and `CliToolExecutor`.
+///
+/// Called once per `session/prompt` request from a `spawn_blocking` thread.
+/// Constructs a fresh `ConversationRuntime` from the provided `Session`
+/// snapshot and runs one turn, returning the resulting [`acp::SessionEvent`]s.
+///
+/// # Design
+///
+/// - `AnthropicRuntimeClient` is constructed fresh per turn so each call
+///   gets a clean model context (model override from `session.model` is
+///   honoured).
+/// - `CliToolExecutor` receives the full `GlobalToolRegistry` from the
+///   process-level plugin state.
+/// - `AcpPermissionPrompter` bridges the blocking `PermissionPrompter` trait
+///   into the async world via `Handle::block_on`.
+/// - The resulting `TurnSummary` is converted to `SessionEvent`s via
+///   `acp::turn_summary_to_events`.
+struct CliTurnExecutorFactory {
+    /// Default model to use when the session does not specify one.
+    default_model: String,
+    /// Tool registry (builtin + plugin tools).
+    tool_registry: GlobalToolRegistry,
+    /// Permission mode for the session (typically DangerFullAccess for ACP).
+    permission_mode: PermissionMode,
+    /// Runtime feature config (hooks, etc).
+    feature_config: runtime::RuntimeFeatureConfig,
+}
+
+impl CliTurnExecutorFactory {
+    fn new(
+        default_model: String,
+        tool_registry: GlobalToolRegistry,
+        permission_mode: PermissionMode,
+        feature_config: runtime::RuntimeFeatureConfig,
+    ) -> Self {
+        Self {
+            default_model,
+            tool_registry,
+            permission_mode,
+            feature_config,
+        }
+    }
+}
+
+impl acp::TurnExecutorFactory for CliTurnExecutorFactory {
+    fn execute(
+        &self,
+        session: runtime::Session,
+        user_input: String,
+        turn_id: String,
+        slot: std::sync::Arc<tokio::sync::Mutex<acp::session::SessionSlot>>,
+        handle: tokio::runtime::Handle,
+    ) -> Result<Vec<acp::SessionEvent>, String> {
+        use acp::AcpPermissionPrompter;
+
+        let model = session
+            .model
+            .clone()
+            .unwrap_or_else(|| self.default_model.clone());
+
+        let session_id = session.session_id.clone();
+
+        // Build the permission policy.
+        let policy = permission_policy(self.permission_mode, &self.feature_config, &self.tool_registry)
+            .map_err(|e| format!("failed to build permission policy: {e}"))?;
+
+        // Build the API client. Uses `resolve_cli_auth_source` which reads
+        // `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` / OAuth from the standard
+        // config paths — no hard-coded credentials.
+        let api_client = AnthropicRuntimeClient::new(
+            &session_id,
+            model,
+            true,  // enable_tools
+            false, // emit_output (no terminal in ACP daemon)
+            None,  // allowed_tools — unrestricted
+            self.tool_registry.clone(),
+            None,  // progress_reporter — none in ACP daemon
+        )
+        .map_err(|e| format!("failed to build API client: {e}"))?;
+
+        // Build the tool executor.
+        let tool_executor = CliToolExecutor::new(
+            None, // allowed_tools — unrestricted
+            false, // emit_output
+            self.tool_registry.clone(),
+            None, // mcp_state — MCP not wired in ACP daemon yet
+        );
+
+        // Build the system prompt.
+        let system_prompt = build_system_prompt()
+            .map_err(|e| format!("failed to build system prompt: {e}"))?;
+
+        // Build and run the ConversationRuntime.
+        let mut cr = runtime::ConversationRuntime::new_with_features(
+            session,
+            api_client,
+            tool_executor,
+            policy,
+            system_prompt,
+            &self.feature_config,
+        );
+
+        // Build the permission prompter.
+        let mut prompter = AcpPermissionPrompter::new(session_id, slot, handle);
+
+        // Run the turn synchronously (we're already in spawn_blocking).
+        let summary = cr
+            .run_turn(user_input, Some(&mut prompter))
+            .map_err(|e| e.to_string())?;
+
+        // Convert TurnSummary → Vec<SessionEvent>.
+        Ok(acp::turn_summary_to_events(&turn_id, &summary))
+    }
+}
+
 /// Hand off to the `acp` crate's transport loop.
 ///
 /// With `addr = None` we speak ACP over stdio (default for editor/agent
 /// spawn). With `addr = Some(host:port)` a WebSocket listener is bound.
-/// M1 (transport) and M2 (session lifecycle: `initialize`,
-/// `session/new`/`resume`/`close`/`list`) are wired; tool streaming
-/// (M3) and permission prompts (M4) still return a structured
-/// JSON-RPC `-32601` error. See ROADMAP #76 for the full milestone
-/// plan.
+/// Phase 2.5: wires the real `CliTurnExecutorFactory` so `session/prompt`
+/// calls produce actual LLM responses via `AnthropicRuntimeClient` +
+/// `CliToolExecutor` + `AcpPermissionPrompter`.
 fn run_acp_serve(addr: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    // M2: default workspace_root / data_dir to `None` so the server
-    // uses its own cwd. Editor clients (Zed, happy) can later pass an
-    // explicit root via a `--workspace-root` flag once we wire it
-    // through — see the M3 follow-up in ROADMAP #76.
+    // Build the executor factory from current process state.
+    // `build_runtime_plugin_state` loads the merged settings.json, plugin
+    // manifests, and MCP config for the current cwd — same as REPL startup.
+    let runtime_plugin_state = build_runtime_plugin_state()?;
+    let permission_mode = default_permission_mode();
+
+    let factory: std::sync::Arc<dyn acp::TurnExecutorFactory> =
+        std::sync::Arc::new(CliTurnExecutorFactory::new(
+            DEFAULT_MODEL.to_string(),
+            runtime_plugin_state.tool_registry,
+            permission_mode,
+            runtime_plugin_state.feature_config,
+        ));
+
     let options = match addr {
         Some(addr) => acp::ServeOptions::WebSocket {
             addr,
@@ -5992,9 +6120,10 @@ fn run_acp_serve(addr: Option<String>) -> Result<(), Box<dyn std::error::Error>>
             data_dir: None,
         },
     };
+
     let runtime = tokio::runtime::Runtime::new()?;
     runtime
-        .block_on(acp::serve(options))
+        .block_on(acp::serve(options, Some(factory)))
         .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }
 
