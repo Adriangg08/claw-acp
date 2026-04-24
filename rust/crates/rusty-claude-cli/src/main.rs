@@ -384,6 +384,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::AcpServe { addr } => run_acp_serve(addr)?,
+        CliAction::AcpMigrate { pg_url } => run_acp_migrate(pg_url)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         // #146: dispatch pure-local introspection. Text mode uses existing
@@ -520,6 +521,10 @@ enum CliAction {
     AcpServe {
         addr: Option<String>,
     },
+    /// `claw acp migrate` — migrate JSONL sessions to Postgres.
+    AcpMigrate {
+        pg_url: Option<String>,
+    },
     State {
         output_format: CliOutputFormat,
     },
@@ -561,6 +566,7 @@ enum LocalHelpTopic {
     Sandbox,
     Doctor,
     Acp,
+    AcpMigrate,
     // #141: extend the local-help pattern to every subcommand so
     // `claw <subcommand> --help` has one consistent contract.
     Init,
@@ -1004,6 +1010,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 }
 
 fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>> {
+    // Handle 3-element case: "acp migrate --help" or "acp migrate -h"
+    if rest.len() == 3 && rest[0] == "acp" && rest[1] == "migrate" && is_help_flag(&rest[2]) {
+        return Some(Ok(CliAction::HelpTopic(LocalHelpTopic::AcpMigrate)));
+    }
+
+    // Standard 2-element case: "subcommand --help"
     if rest.len() != 2 || !is_help_flag(&rest[1]) {
         return None;
     }
@@ -1013,6 +1025,7 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
         "sandbox" => LocalHelpTopic::Sandbox,
         "doctor" => LocalHelpTopic::Doctor,
         "acp" => LocalHelpTopic::Acp,
+        "acp migrate" => LocalHelpTopic::AcpMigrate,
         // #141: add the subcommands that were previously falling back
         // to global help (init/state/export/version) or erroring out
         // (system-prompt/dump-manifests) or printing their primary
@@ -1143,8 +1156,9 @@ fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<Cli
         // server speaks its own wire protocol rather than the CLI's
         // text/json success envelope.
         [subcommand, rest @ ..] if subcommand == "serve" => parse_acp_serve_args(rest),
+        [subcommand, rest @ ..] if subcommand == "migrate" => parse_acp_migrate_args(rest),
         _ => Err(String::from(
-            "unsupported ACP invocation. Use `claw acp`, `claw acp serve [--addr host:port]`, `claw --acp`, or `claw -acp`.",
+            "unsupported ACP invocation. Use `claw acp`, `claw acp serve [--addr host:port]`, `claw acp migrate [--pg-url <url>]`, `claw --acp`, or `claw -acp`.",
         )),
     }
 }
@@ -1171,6 +1185,30 @@ fn parse_acp_serve_args(args: &[String]) -> Result<CliAction, String> {
         }
     }
     Ok(CliAction::AcpServe { addr })
+}
+
+fn parse_acp_migrate_args(args: &[String]) -> Result<CliAction, String> {
+    let mut pg_url: Option<String> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--pg-url" => {
+                let value = iter.next().ok_or_else(|| {
+                    String::from("--pg-url requires a Postgres connection URL")
+                })?;
+                pg_url = Some(value.clone());
+            }
+            value if value.starts_with("--pg-url=") => {
+                pg_url = Some(value.trim_start_matches("--pg-url=").to_string());
+            }
+            other => {
+                return Err(format!(
+                    "unsupported `claw acp migrate` argument {other:?}. Accepted flags: --pg-url <url> (or use CLAW_PG_URL / DATABASE_URL env var)."
+                ));
+            }
+        }
+    }
+    Ok(CliAction::AcpMigrate { pg_url })
 }
 
 fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
@@ -5901,12 +5939,25 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Related          /doctor · claw --resume latest /doctor"
             .to_string(),
         LocalHelpTopic::Acp => "ACP / Zed
-  Usage            claw acp [serve [--addr host:port]] [--output-format <format>]
+  Usage            claw acp [serve [--addr host:port]] [migrate [--pg-url <url>]] [--output-format <format>]
   Aliases          claw --acp · claw -acp
-  Purpose          explain the current editor-facing ACP/Zed launch contract or start the ACP transport loop (M1: stdio/websocket; sessions still stubbed)
+  Purpose          explain the current editor-facing ACP/Zed launch contract, start the ACP transport loop, or migrate JSONL sessions to Postgres
+  Subcommands      serve [--addr host:port] — start the ACP transport loop (M1: stdio/websocket; sessions still stubbed)
+                   migrate [--pg-url <url>] — migrate existing JSONL sessions to Postgres (uses CLAW_PG_URL or DATABASE_URL if --pg-url not provided)
   Status           discoverability only; `serve` is a status alias and does not launch a daemon yet
   Formats          text (default), json
   Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · claw --help"
+            .to_string(),
+        LocalHelpTopic::AcpMigrate => "ACP Migrate
+  Usage            claw acp migrate [--pg-url <url>] [--output-format <format>]
+  Purpose          migrate JSONL session files from local storage to Postgres backend
+  Args             --pg-url <url> — optional Postgres connection URL (libpq format)
+                   Falls back to CLAW_PG_URL env var, then DATABASE_URL
+                   Format: postgres://user:pass@localhost:5432/database
+  Output           migration report with counts: sessions migrated, skipped, events inserted, failures
+  Idempotency      safe to re-run; uses ON CONFLICT DO NOTHING for duplicate events
+  Formats          text (default), json
+  Related          claw acp · docs/runbooks/acp-m3-cutover.md"
             .to_string(),
         LocalHelpTopic::Init => "Init
   Usage            claw init [--output-format <format>]
@@ -6125,6 +6176,51 @@ fn run_acp_serve(addr: Option<String>) -> Result<(), Box<dyn std::error::Error>>
     runtime
         .block_on(acp::serve(options, Some(factory)))
         .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
+}
+
+/// Migrate JSONL sessions to Postgres.
+fn run_acp_migrate(pg_url: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve the Postgres URL from arg, env vars, or error.
+    let url = match pg_url {
+        Some(u) => u,
+        None => {
+            std::env::var("CLAW_PG_URL")
+                .or_else(|_| std::env::var("DATABASE_URL"))
+                .map_err(|_| {
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "CLAW_PG_URL or DATABASE_URL env var required (or use --pg-url <url>)",
+                    )) as Box<dyn std::error::Error>
+                })?
+        }
+    };
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        // Load the JSONL session store from the current working directory.
+        let store = runtime::SessionStore::from_cwd(&std::env::current_dir()?)
+            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error>)?;
+
+        // Connect to Postgres.
+        let pg = acp::backend_postgres::PostgresSessionBackend::connect(&url)
+            .await
+            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error>)?;
+
+        // Run migrations to create tables if needed.
+        pg.run_migrations()
+            .await
+            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error>)?;
+
+        // Perform the migration.
+        let report = acp::migrate::migrate_store_to_postgres(&store, &pg)
+            .await
+            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error>)?;
+
+        // Print the report.
+        println!("{}", report);
+
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
 }
 
 fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
@@ -10666,6 +10762,7 @@ mod tests {
             ("state", LocalHelpTopic::State),
             ("export", LocalHelpTopic::Export),
             ("version", LocalHelpTopic::Version),
+            ("acp migrate", LocalHelpTopic::AcpMigrate),
             ("system-prompt", LocalHelpTopic::SystemPrompt),
             ("dump-manifests", LocalHelpTopic::DumpManifests),
             ("bootstrap-plan", LocalHelpTopic::BootstrapPlan),

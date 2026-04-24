@@ -242,22 +242,18 @@ converts each `ConversationMessage` to a `session_events` row and each
 
 **Command**:
 
-The migration runs as a standalone binary (not yet wired as a `claw acp migrate`
-subcommand — see note below):
-
 ```bash
-CLAW_SESSION_BACKEND=postgres \
-CLAW_PG_URL=postgresql://acp:acp_local_dev@localhost:5432/acp \
-claw acp serve --migrate-only 2>&1
+claw acp migrate --pg-url postgresql://acp:acp_local_dev@localhost:5432/acp
 ```
 
-> **Note**: As of `f0e49e0`, the `claw acp migrate` subcommand parsing is
-> defined in the spec (SPEC.md F1.5, TASKS.md T1.8) but the CLI argument
-> `migrate` is not yet wired in `parse_acp_args` — only `serve` is handled
-> (see `main.rs:1145`). The migration logic is fully implemented in
-> `rust/crates/acp/src/migrate.rs`. To run it directly without a CLI flag,
-> call the migration function from a small Rust test or wire the subcommand
-> manually. This is a cosmetic gap — the implementation is complete.
+Alternatively, if you have the env vars set:
+
+```bash
+export CLAW_PG_URL=postgresql://acp:acp_local_dev@localhost:5432/acp
+claw acp migrate
+```
+
+For more details: `claw acp migrate --help`
 
 If migration is not critical right now, skip this step. The Postgres backend
 will start fresh and sessions will accumulate from first use.
