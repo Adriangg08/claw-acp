@@ -16,6 +16,8 @@
 //! Tracked upstream as ROADMAP #76. Spec:
 //! <https://github.com/zed-industries/agent-client-protocol>.
 
+pub mod backend_postgres;
+pub mod migrate;
 pub mod session;
 pub mod stream;
 pub mod tools;
@@ -32,7 +34,7 @@ pub use transport::{StdioTransport, Transport, TransportError, WebSocketTranspor
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use runtime::SessionStore;
+use runtime::{FileSessionBackend, SessionBackend, SessionStore};
 use serde_json::{json, Value};
 
 /// Options passed from `claw acp serve` into the server entrypoint.
@@ -84,6 +86,9 @@ pub enum AcpError {
     /// Session store failed to initialize (bad workspace root, perms, ...).
     #[error("ACP session store error: {0}")]
     SessionStore(String),
+    /// Backend configuration error (missing DATABASE_URL, connection refused, ...).
+    #[error("ACP backend error: {0}")]
+    Backend(String),
 }
 
 /// Launch the ACP server with the given options.
@@ -94,6 +99,10 @@ pub enum AcpError {
 /// tool execution (M3) and permissions (M4) still return a structured
 /// JSON-RPC `-32601` error.
 ///
+/// Backend is selected via `CLAW_SESSION_BACKEND`:
+/// - `file` (default) — existing JSONL behavior, no Postgres dependency.
+/// - `postgres` — requires `CLAW_PG_URL` or `DATABASE_URL` to be set.
+///
 /// This is the single integration point used by `rusty-claude-cli` so the
 /// CLI does not need to depend on internal module layout.
 pub async fn serve(options: ServeOptions) -> Result<(), AcpError> {
@@ -102,8 +111,8 @@ pub async fn serve(options: ServeOptions) -> Result<(), AcpError> {
             workspace_root,
             data_dir,
         } => {
-            let store = build_session_store(workspace_root, data_dir)?;
-            let handler = Arc::new(SessionHandler::new(store));
+            let (store, backend) = build_session_backend(workspace_root, data_dir).await?;
+            let handler = Arc::new(SessionHandler::new_with_backend(store, backend));
             tracing::info!("ACP server listening on stdio (Content-Length framing)");
             let transport = StdioTransport::new();
             run_dispatch_loop(transport, handler).await
@@ -113,10 +122,10 @@ pub async fn serve(options: ServeOptions) -> Result<(), AcpError> {
             workspace_root,
             data_dir,
         } => {
-            let store = build_session_store(workspace_root, data_dir)?;
+            let (store, backend) = build_session_backend(workspace_root, data_dir).await?;
             // Share one handler across all websocket sessions so `session/list`
             // reflects every connected client in this process.
-            let handler = Arc::new(SessionHandler::new(store));
+            let handler = Arc::new(SessionHandler::new_with_backend(store, backend));
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             let bound = listener.local_addr()?;
             tracing::info!(%bound, "ACP server listening on websocket");
@@ -142,6 +151,63 @@ pub async fn serve(options: ServeOptions) -> Result<(), AcpError> {
                     }
                 });
             }
+        }
+    }
+}
+
+/// Resolve the session store and backend based on `CLAW_SESSION_BACKEND`.
+///
+/// Returns `(SessionStore, Arc<dyn SessionBackend>)`.
+/// The `SessionStore` is still needed for the file backend's JSONL persistence.
+async fn build_session_backend(
+    workspace_root: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+) -> Result<(SessionStore, Arc<dyn SessionBackend>), AcpError> {
+    let store = build_session_store(workspace_root, data_dir)?;
+    let backend_env = std::env::var("CLAW_SESSION_BACKEND").unwrap_or_else(|_| "file".to_string());
+
+    match backend_env.to_lowercase().as_str() {
+        "postgres" => {
+            let url = std::env::var("CLAW_PG_URL")
+                .or_else(|_| std::env::var("DATABASE_URL"))
+                .map_err(|_| {
+                    AcpError::Backend(
+                        "CLAW_SESSION_BACKEND=postgres requires CLAW_PG_URL or DATABASE_URL"
+                            .to_string(),
+                    )
+                })?;
+            let pg = crate::backend_postgres::PostgresSessionBackend::connect(&url)
+                .await
+                .map_err(|e| AcpError::Backend(e.to_string()))?;
+            pg.run_migrations()
+                .await
+                .map_err(|e| AcpError::Backend(e.to_string()))?;
+
+            // T1.9: spawn the stale-client reaper task.
+            // Runs immediately on startup and then every 5 minutes.
+            // Heartbeat window: 5 minutes = 300_000 ms.
+            let reaper_pool = pg.pool().clone();
+            tokio::spawn(async move {
+                const HEARTBEAT_TTL_MS: i64 = 300_000;
+                const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+                loop {
+                    if let Err(err) =
+                        crate::backend_postgres::reap_stale_clients(&reaper_pool, HEARTBEAT_TTL_MS)
+                            .await
+                    {
+                        tracing::warn!(error = %err, "reaper task failed");
+                    }
+                    tokio::time::sleep(REAP_INTERVAL).await;
+                }
+            });
+
+            tracing::info!("ACP using Postgres session backend");
+            Ok((store, Arc::new(pg) as Arc<dyn SessionBackend>))
+        }
+        "file" | _ => {
+            let backend = FileSessionBackend::new(store.clone());
+            tracing::info!("ACP using file session backend");
+            Ok((store, Arc::new(backend) as Arc<dyn SessionBackend>))
         }
     }
 }

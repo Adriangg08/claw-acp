@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use runtime::session_control::SessionControlError;
-use runtime::{Session, SessionStore};
+use runtime::{FileSessionBackend, Session, SessionBackend, SessionStore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
@@ -247,7 +247,7 @@ pub struct SessionSlot {
 // ---------------------------------------------------------------------------
 
 /// Owns the active-session registry and routes ACP session lifecycle
-/// messages to the underlying [`SessionStore`].
+/// messages to the underlying [`SessionStore`] and [`SessionBackend`].
 ///
 /// Internally: one `Arc<Mutex<SessionSlot>>` per live session, keyed by
 /// session id, wrapped in a top-level `RwLock` so list/lookup are
@@ -256,17 +256,35 @@ pub struct SessionSlot {
 pub struct SessionHandler {
     runtimes: RwLock<HashMap<String, Arc<Mutex<SessionSlot>>>>,
     store: SessionStore,
+    /// Pluggable storage backend (file or Postgres) selected via
+    /// `CLAW_SESSION_BACKEND`. See DESIGN.md §2 and SPEC.md F1.4.
+    backend: Arc<dyn SessionBackend>,
 }
 
 impl SessionHandler {
-    /// Build a new handler backed by `store`. Call sites typically scope
-    /// the store with [`SessionStore::from_data_dir`] using the ACP
-    /// client's workspace root (see Q1 note above).
+    /// Build a new handler backed by `store` using the file backend.
+    ///
+    /// Preserved for backward compatibility and tests. Production paths call
+    /// [`Self::new_with_backend`] after backend selection.
     #[must_use]
     pub fn new(store: SessionStore) -> Self {
+        let backend = Arc::new(FileSessionBackend::new(store.clone()));
         Self {
             runtimes: RwLock::new(HashMap::new()),
             store,
+            backend,
+        }
+    }
+
+    /// Build a new handler with an explicit [`SessionBackend`].
+    ///
+    /// Called by `serve()` after `build_session_backend()` resolves the env var.
+    #[must_use]
+    pub fn new_with_backend(store: SessionStore, backend: Arc<dyn SessionBackend>) -> Self {
+        Self {
+            runtimes: RwLock::new(HashMap::new()),
+            store,
+            backend,
         }
     }
 
@@ -276,6 +294,12 @@ impl SessionHandler {
     #[must_use]
     pub fn store(&self) -> &SessionStore {
         &self.store
+    }
+
+    /// Expose the backend — useful for tests and migration helpers.
+    #[must_use]
+    pub fn backend(&self) -> &Arc<dyn SessionBackend> {
+        &self.backend
     }
 
     /// Respond to the ACP `initialize` handshake.
@@ -302,9 +326,8 @@ impl SessionHandler {
         }
     }
 
-    /// Create a new session, persist it, and register it in the active
-    /// registry. Returns the session id + the effective workspace root
-    /// (the store's root, not the client's raw input — see Q1).
+    /// Create a new session, persist it via the backend, and register it in the
+    /// active registry. Returns the session id + the effective workspace root.
     pub async fn handle_new(&self, params: NewSessionParams) -> Result<NewSessionResult, AcpError> {
         let workspace_root = self.store.workspace_root().to_path_buf();
 
@@ -313,11 +336,16 @@ impl SessionHandler {
             session.model = Some(model);
         }
 
+        // Persist via backend (file backend writes JSONL; Postgres backend inserts row).
+        self.backend
+            .create_session(&session)
+            .await
+            .map_err(|err| AcpError::Store(format!("failed to persist new session: {err}")))?;
+
+        // For the file backend: also keep a persistence path on the Session so
+        // push_message works correctly (file backend uses Session::append_persisted_message).
         let handle = self.store.create_handle(&session.session_id);
         session = session.with_persistence_path(handle.path.clone());
-        session
-            .save_to_path(&handle.path)
-            .map_err(|err| AcpError::Store(format!("failed to persist new session: {err}")))?;
 
         let session_id = session.session_id.clone();
         let slot = Arc::new(Mutex::new(SessionSlot {
@@ -387,10 +415,8 @@ impl SessionHandler {
         })
     }
 
-    /// Close a session, removing it from the active registry. Returns
-    /// an error if the session id is unknown — we pick the stricter of
-    /// the two reasonable contracts so mis-wired clients fail loudly
-    /// rather than no-op silently.
+    /// Close a session, removing it from the active registry and marking it
+    /// closed in the backend. Returns an error if the session id is unknown.
     pub async fn handle_close(&self, params: CloseSessionParams) -> Result<(), AcpError> {
         let removed = {
             let mut guard = self.runtimes.write().await;
@@ -398,6 +424,15 @@ impl SessionHandler {
         };
         match removed {
             Some(_) => {
+                // Mark session as closed in backend (best-effort; don't fail the
+                // close operation if the backend write fails).
+                if let Err(err) = self.backend.close_session(&params.session_id).await {
+                    tracing::warn!(
+                        session_id = %params.session_id,
+                        error = %err,
+                        "backend close_session failed (non-fatal)"
+                    );
+                }
                 tracing::info!(session_id = %params.session_id, "ACP session closed");
                 Ok(())
             }
@@ -405,15 +440,20 @@ impl SessionHandler {
         }
     }
 
-    /// List all currently-active (in-memory) sessions.
+    /// List all open sessions: both live (in-memory) and dormant (backend).
     ///
-    /// NOTE: this is the *live* registry, not the full on-disk session
-    /// list. Dormant sessions on disk are only surfaced when a client
-    /// successfully resumes them.
+    /// Per SPEC.md F1.6: merges the in-memory registry with backend's
+    /// `list_open_sessions`, deduplicating by `session_id`.
     pub async fn handle_list(&self) -> ListSessionsResult {
+        let workspace_root = self.store.workspace_root().to_string_lossy().to_string();
+
+        // Collect live (in-memory) sessions first.
         let guard = self.runtimes.read().await;
+        let mut seen = std::collections::HashSet::new();
         let mut sessions = Vec::with_capacity(guard.len());
+
         for (id, slot) in guard.iter() {
+            seen.insert(id.clone());
             let slot = slot.lock().await;
             sessions.push(SessionSummary {
                 session_id: id.clone(),
@@ -421,6 +461,26 @@ impl SessionHandler {
                 model: slot.session.model.clone(),
             });
         }
+
+        // Merge dormant sessions from the backend (dedup by session_id).
+        match self.backend.list_open_sessions(&workspace_root).await {
+            Ok(rows) => {
+                for row in rows {
+                    if seen.contains(&row.session_id) {
+                        continue; // already represented by the live entry
+                    }
+                    sessions.push(SessionSummary {
+                        session_id: row.session_id,
+                        message_count: row.message_count.unwrap_or(0) as usize,
+                        model: row.model,
+                    });
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "backend list_open_sessions failed — serving live-only list");
+            }
+        }
+
         // Deterministic ordering so clients can diff list snapshots.
         sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
         ListSessionsResult { sessions }
