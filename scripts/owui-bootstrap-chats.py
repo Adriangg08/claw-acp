@@ -96,7 +96,11 @@ def fetch_sessions(conn, min_events: int) -> list[dict]:
                 s.created_at_ms,
                 COUNT(e.event_id)   AS event_count,
                 (
-                    SELECT e2.payload->>'text'
+                    SELECT COALESCE(
+                        e2.payload->>'text',
+                        e2.payload->'blocks'->0->>'text',
+                        e2.payload->'content'->0->>'text'
+                    )
                     FROM   session_events e2
                     WHERE  e2.session_id = s.session_id
                       AND  e2.role       = 'user'
@@ -139,22 +143,32 @@ def insert_mapping(conn, chat_id: str, session_id: str, workspace_root: str) -> 
 # Open WebUI helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _owui_headers(token: str) -> dict:
-    return {
+def _owui_headers(token: str, host_header: Optional[str] = None) -> dict:
+    headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
+    if host_header:
+        headers["Host"] = host_header
+    return headers
 
 
 def derive_title(session: dict) -> str:
-    """Derive a chat title from the session's first user message (truncated)."""
+    """Derive a chat title from the session's first user message, or workspace + date."""
     msg: Optional[str] = session.get("first_user_message")
     if msg:
-        return msg[:80] + ("..." if len(msg) > 80 else "")
-    return f"ACP session {session['session_id'][:8]}"
+        msg_clean = msg.strip().replace("\n", " ")
+        return msg_clean[:80] + ("..." if len(msg_clean) > 80 else "")
+    # Fallback: [CLAW] <last-segment-of-workspace> · <YYYY-MM-DD>
+    import datetime as _dt
+    ws = (session.get("workspace_root") or "").rstrip("/")
+    leaf = ws.rsplit("/", 1)[-1] if ws else "unknown"
+    created = session.get("created_at_ms") or 0
+    date = _dt.datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d") if created else "?"
+    return f"[CLAW] {leaf} · {date}"
 
 
-def create_owui_chat(owui_url: str, token: str, title: str) -> str:
+def create_owui_chat(owui_url: str, token: str, title: str, host_header: Optional[str] = None) -> str:
     """
     Create a new chat in Open WebUI via POST /api/v1/chats/new.
 
@@ -172,7 +186,7 @@ def create_owui_chat(owui_url: str, token: str, title: str) -> str:
             "params": {},
         }
     }
-    resp = requests.post(url, headers=_owui_headers(token), json=payload, timeout=30)
+    resp = requests.post(url, headers=_owui_headers(token, host_header), json=payload, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     chat_id: Optional[str] = data.get("id")
@@ -200,6 +214,9 @@ def parse_args() -> argparse.Namespace:
                    help=f"Skip sessions with fewer than N events (default: {DEFAULT_MIN_EVENTS})")
     p.add_argument("--dry-run", action="store_true",
                    help="Preview actions without writing anything")
+    p.add_argument("--host-header", metavar="HOST", default=None,
+                   help="Override the Host header (needed when --owui-url is "
+                        "an internal docker name but OWUI checks the public host)")
     return p.parse_args()
 
 
@@ -252,7 +269,7 @@ def main() -> int:
             continue
 
         try:
-            chat_id = create_owui_chat(args.owui_url, args.owui_token, title)
+            chat_id = create_owui_chat(args.owui_url, args.owui_token, title, args.host_header)
             insert_mapping(conn, chat_id, sid, workspace)
             log.info(
                 "[CREATE]  created OWUI chat %s for ACP session %s "
