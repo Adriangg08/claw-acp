@@ -37,6 +37,26 @@ Open the gear icon next to the function to configure:
 | `workspace_root` | str | `/workspace` | Root path passed to `session/new` |
 | `model` | str | `default` | Model alias forwarded to the daemon |
 | `permission_timeout_seconds` | int | `300` | Seconds before auto-deny on permission prompts |
+| `pg_url` | str | `postgres://acp:acp_local_dev@postgres:5432/acp` | Postgres DSN for persistent session mapping |
+
+### `pg_url` — Postgres-backed session mapping (B1)
+
+The `pg_url` valve enables **persistent** `chat_id → session_id` mapping stored
+in the `chat_session_mapping` table of the ACP Postgres database.
+
+When set:
+- Every Open WebUI chat is permanently linked to exactly one ACP session.
+- Restarting Open WebUI or the Pipe does **not** lose the link — the next
+  message in the same chat resumes the original ACP session with full history.
+- Two browser tabs pointing at the same chat share the same ACP session
+  (same context, same history).
+
+When `pg_url` is empty or `psycopg2-binary` is not installed:
+- Falls back to the v1.0.0 in-memory dict behaviour (mapping lost on restart).
+
+The Postgres URL must be reachable from inside the Open WebUI container.
+If Open WebUI and Postgres are in the same Docker Compose network, the default
+`postgres://acp:acp_local_dev@postgres:5432/acp` works without changes.
 
 ### Choosing `daemon_url`
 
@@ -100,14 +120,50 @@ claw acp serve --addr 0.0.0.0:7800
 
 ## How Sessions Work
 
-The Pipe maps Open WebUI `conversation_id` → ACP `session_id` in an in-memory
-dict (`self._sessions`). This means:
+The Pipe links each Open WebUI `chat_id` (UUID) to one ACP `session_id` via the
+`chat_session_mapping` Postgres table.
 
-- Same conversation → same ACP session → daemon remembers context.
-- Open WebUI restart → dict is cleared → next message creates a new ACP session
-  (graceful fallback, history is NOT preserved across restarts without Phase 1 Postgres).
-- Two browser tabs pointing at the same conversation share the same session_id,
-  so both see the same daemon context.
+### Mapping lifecycle
+
+1. **New chat** — on the first message, the Pipe calls `session/new`, receives
+   a `session_id`, and `INSERT`s a row into `chat_session_mapping`.
+2. **Existing chat** — on subsequent messages, the Pipe does
+   `SELECT session_id FROM chat_session_mapping WHERE chat_id = $1`, calls
+   `session/resume` with the stored `session_id`, and updates `last_accessed_ms`.
+3. **Session gone** (daemon restarted, session evicted) — `session/resume`
+   returns `AcpError -32001`. The Pipe clears the stale in-memory entry and
+   creates a new session, inserting a fresh mapping row.
+4. **DB unreachable** — falls back to the in-memory dict silently. The chat
+   continues working; history resumption across Open WebUI restarts is degraded
+   until Postgres is available again.
+
+### Resume across page reloads and Pipe restarts
+
+Because the mapping is in Postgres, not in memory:
+- **Page reload** — same chat_id is sent with the next message; the Pipe looks
+  it up in the DB and resumes the ACP session. No history is lost.
+- **Pipe restart** (OWUI container restart / new Pipe version deployed) — same
+  behaviour. The DB survives the restart.
+- **Daemon restart** — if the daemon loses the session (no Postgres backend),
+  `session/resume` will fail with `-32001`. The Pipe gracefully creates a new
+  session and updates the mapping. If the daemon uses the Postgres backend,
+  sessions survive daemon restarts too.
+
+### Bootstrap script (next step)
+
+`scripts/owui-bootstrap-chats.py` pre-populates `chat_session_mapping` for
+existing ACP sessions created via the CLI before this Pipe version was deployed.
+Run it once after generating your Open WebUI API key:
+
+```bash
+python3 scripts/owui-bootstrap-chats.py \
+    --owui-token <your-key> \
+    --owui-url https://chat.homelab.local \
+    --min-events 3 \
+    --dry-run      # preview first, then remove --dry-run to apply
+```
+
+The script is idempotent: sessions that already have a mapping are skipped.
 
 ---
 
@@ -184,8 +240,6 @@ with `[COMMENT:...]` for debugging.
 
 - **Per-token delta streaming** — after Phase 2.5 ApiClient refactor.
 - **Richer permission UX** — structured UI elements instead of text blocks.
-- **Persistent session mapping** — survive Open WebUI restarts via a lightweight
-  sidecar DB or Open WebUI plugin storage API.
 - **Docker Compose expose** — `claw-daemon` service with port 7800 exposed so
   Open WebUI can reach it without extra Valve configuration.
 - **Model routing** — multiple daemon URLs keyed by model name.

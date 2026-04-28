@@ -1,10 +1,25 @@
 """
 claw_acp_pipe.py — Open WebUI Pipe Function for the claw ACP daemon.
 
-Version: 1.0.0
+Version: 2.0.0
 Protocol: ACP JSON-RPC 2.0, version "0.2"
 Daemon capabilities required: streaming=true, tools=true (Phase 2+)
                               permissions=true (Phase 4+)
+
+────────────────────────────────────────────────────────────────
+SESSION PERSISTENCE (B1)
+────────────────────────────────────────────────────────────────
+Each Open WebUI chat_id is permanently linked to one ACP session_id via the
+`chat_session_mapping` table in Postgres.  On every pipe() call:
+
+  • chat_id found in DB → session/resume the linked ACP session, update
+    last_accessed_ms.  History and context are fully preserved across Open
+    WebUI restarts and page reloads.
+
+  • chat_id NOT in DB → session/new, then INSERT mapping row.
+
+  • DB unreachable → fall back to in-memory dict (same behaviour as v1.0.0).
+    The Pipe never crashes the chat due to a DB error.
 
 ────────────────────────────────────────────────────────────────
 INSTALLATION
@@ -17,7 +32,7 @@ INSTALLATION
    - workspace_root: path the daemon uses for new sessions
    - model: model alias passed to session/new (e.g. "sonnet")
    - permission_timeout_seconds: seconds to wait for user allow/deny
-5. In any conversation, select "claw" as the model.
+   - pg_url: Postgres connection string for the ACP database
 
 ────────────────────────────────────────────────────────────────
 MANUAL TEST PROCEDURE (no CI — Open WebUI cannot be spawned)
@@ -45,6 +60,11 @@ T5 — Permission prompt (requires PermissionMode=Prompt on daemon):
   PERMISSION REQUEST block in the response. Reply "allow" or "deny"
   in the next message.
 
+T6 — Session resume across restart:
+  Note the chat_id. Restart Open WebUI. Send a follow-up message in
+  the same chat. Expect the daemon to resume the original ACP session
+  (verify via daemon logs: "session/resume <session_id>").
+
 ────────────────────────────────────────────────────────────────
 LIMITATIONS (current)
 ────────────────────────────────────────────────────────────────
@@ -53,8 +73,6 @@ LIMITATIONS (current)
   Phase 2.5 refactor of ApiClient (see docs/acp-m3/blockers/).
 - Permission UX is text-based: user types "allow" or "deny" as
   their next message to resolve a pending permission prompt.
-- Session map is in-memory: restarting Open WebUI loses the
-  conversation→session mapping; the Pipe falls back to session/new.
 - No image/file forwarding.
 - No multi-model routing (one daemon URL per Valve config).
 
@@ -62,6 +80,7 @@ LIMITATIONS (current)
 REQUIREMENTS
 ────────────────────────────────────────────────────────────────
 Python stdlib + websockets (pre-installed in Open WebUI >= 0.3.x).
+psycopg2-binary (pre-installed in Open WebUI >= 0.3.x).
 If websockets is missing the Pipe returns a clear error in the UI.
 """
 
@@ -69,6 +88,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from typing import AsyncGenerator, Optional
 
@@ -79,7 +99,16 @@ try:
 except ImportError:
     _WEBSOCKETS_AVAILABLE = False
 
+try:
+    import psycopg2  # type: ignore
+    import psycopg2.extras  # type: ignore
+    _PSYCOPG2_AVAILABLE = True
+except ImportError:
+    _PSYCOPG2_AVAILABLE = False
+
 from pydantic import BaseModel
+
+log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -93,6 +122,62 @@ class AcpError(Exception):
 
 
 # ──────────────────────────────────────────────────────────────
+# DB helpers (synchronous — psycopg2, connection-per-call)
+# ──────────────────────────────────────────────────────────────
+
+def _db_lookup(pg_url: str, chat_id: str) -> Optional[tuple[str, str]]:
+    """
+    Look up a chat_id in chat_session_mapping.
+
+    Returns (session_id, workspace_root) if found, None otherwise.
+    Raises on connection/query errors — caller must catch.
+    """
+    with psycopg2.connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT session_id, workspace_root "
+                "FROM chat_session_mapping "
+                "WHERE chat_id = %s",
+                (chat_id,),
+            )
+            row = cur.fetchone()
+    return (row[0], row[1]) if row else None
+
+
+def _db_touch(pg_url: str, chat_id: str) -> None:
+    """
+    Update last_accessed_ms for an existing mapping row.
+    Best-effort: caller should not surface errors to the user.
+    """
+    with psycopg2.connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE chat_session_mapping "
+                "SET last_accessed_ms = (extract(epoch from now()) * 1000)::BIGINT "
+                "WHERE chat_id = %s",
+                (chat_id,),
+            )
+        conn.commit()
+
+
+def _db_insert(pg_url: str, chat_id: str, session_id: str, workspace_root: str) -> None:
+    """
+    Insert a new chat_id → session_id mapping.
+    Uses INSERT … ON CONFLICT DO NOTHING so concurrent Pipe calls are safe.
+    """
+    with psycopg2.connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO chat_session_mapping "
+                "(chat_id, session_id, workspace_root) "
+                "VALUES (%s, %s, %s) "
+                "ON CONFLICT (chat_id) DO NOTHING",
+                (chat_id, session_id, workspace_root),
+            )
+        conn.commit()
+
+
+# ──────────────────────────────────────────────────────────────
 # Pipe
 # ──────────────────────────────────────────────────────────────
 
@@ -101,8 +186,9 @@ class Pipe:
     Open WebUI Pipe Function: bridges chat completions to the claw ACP daemon.
 
     Each pipe() call opens a fresh WebSocket connection, runs one full turn,
-    then closes. Session continuity across turns is maintained by mapping the
-    Open WebUI conversation_id to a daemon session_id in self._sessions.
+    then closes.  Session continuity is maintained via the chat_session_mapping
+    Postgres table (B1).  The in-memory dict (_sessions) is kept as a fallback
+    when Postgres is unreachable.
     """
 
     class Valves(BaseModel):
@@ -128,15 +214,73 @@ class Pipe:
         """Seconds to wait for the user to respond to a permission prompt
         before auto-denying the tool call."""
 
+        pg_url: str = "postgres://acp:acp_local_dev@postgres:5432/acp"
+        """Postgres connection string for the ACP database.
+        Used to persist the chat_id → session_id mapping across Open WebUI
+        restarts.  Must be reachable from inside the Open WebUI container.
+        Format: postgres://<user>:<password>@<host>:<port>/<dbname>
+        Set to an empty string to disable Postgres persistence (falls back
+        to in-memory mapping, same as Pipe v1.0.0 behaviour)."""
+
     def __init__(self) -> None:
         self.valves = self.Valves()
-        # conversation_id → session_id mapping.
-        # Survives for the lifetime of the Open WebUI server process.
-        # Lost on Open WebUI restart; pipe falls back to session/new gracefully.
+        # Fallback in-memory map used when Postgres is unavailable.
+        # chat_id → session_id; survives for the lifetime of the OWUI process.
         self._sessions: dict[str, str] = {}
-        # Pending permission request_id per conversation.
+        # Pending permission request_id per chat.
         # Set when a permission_request event arrives; cleared when resolved.
-        self._pending_permissions: dict[str, str] = {}  # conversation_id → request_id
+        self._pending_permissions: dict[str, str] = {}  # chat_id → request_id
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Session resolution — Postgres-backed with in-memory fallback
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _resolve_session(self, chat_id: str) -> Optional[str]:
+        """
+        Return the ACP session_id for chat_id, or None if not found.
+
+        Lookup order:
+        1. Postgres chat_session_mapping (persistent, survives restarts).
+        2. In-memory _sessions dict (fallback when PG is unavailable).
+
+        Side-effect: updates last_accessed_ms in Postgres on a hit.
+        """
+        if chat_id and self.valves.pg_url and _PSYCOPG2_AVAILABLE:
+            try:
+                row = _db_lookup(self.valves.pg_url, chat_id)
+                if row:
+                    session_id, _workspace = row
+                    try:
+                        _db_touch(self.valves.pg_url, chat_id)
+                    except Exception:  # noqa: BLE001
+                        log.warning("acp_pipe: failed to update last_accessed_ms for chat_id=%s", chat_id)
+                    # Sync in-memory cache so _resolve_permission can find it.
+                    self._sessions[chat_id] = session_id
+                    return session_id
+            except Exception as exc:  # noqa: BLE001
+                log.warning("acp_pipe: DB lookup failed, falling back to memory: %s", exc)
+
+        # Fallback: in-memory dict.
+        return self._sessions.get(chat_id)
+
+    def _persist_session(self, chat_id: str, session_id: str, workspace_root: str) -> None:
+        """
+        Save a new chat_id → session_id mapping.
+
+        Writes to Postgres (idempotent INSERT … ON CONFLICT DO NOTHING) and
+        also updates the in-memory cache.  DB errors are logged but not raised
+        so a DB outage never crashes the chat.
+        """
+        self._sessions[chat_id] = session_id
+        if self.valves.pg_url and _PSYCOPG2_AVAILABLE:
+            try:
+                _db_insert(self.valves.pg_url, chat_id, session_id, workspace_root)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("acp_pipe: failed to persist mapping chat_id=%s → %s: %s", chat_id, session_id, exc)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Public entry point
+    # ──────────────────────────────────────────────────────────────────────────
 
     async def pipe(self, body: dict) -> AsyncGenerator[str, None]:
         """
@@ -144,6 +288,10 @@ class Pipe:
 
         Receives OpenAI chat completions body, converts it to ACP session/prompt,
         and yields SSE chunks in OpenAI streaming format.
+
+        chat_id extraction:
+          Open WebUI injects the chat UUID into body["metadata"]["chat_id"].
+          Some older versions also expose it at body["chat_id"]; we check both.
         """
         if not _WEBSOCKETS_AVAILABLE:
             yield self._sse_chunk(
@@ -152,8 +300,11 @@ class Pipe:
             )
             return
 
-        conversation_id: Optional[str] = (
-            body.get("metadata", {}).get("conversation_id") or None
+        metadata: dict = body.get("metadata") or {}
+        chat_id: Optional[str] = (
+            metadata.get("chat_id")
+            or body.get("chat_id")
+            or None
         )
         model: str = body.get("model", self.valves.model) or self.valves.model
         messages: list = body.get("messages", [])
@@ -166,27 +317,27 @@ class Pipe:
 
         # ── Permission resolution shortcut ──────────────────────────────────
         # If the user's message is "allow" or "deny" and there is a pending
-        # permission prompt for this conversation, resolve it via a dedicated
-        # WS call rather than starting a new prompt turn.
-        if conversation_id and conversation_id in self._pending_permissions:
+        # permission prompt for this chat, resolve it via a dedicated WS call
+        # rather than starting a new prompt turn.
+        if chat_id and chat_id in self._pending_permissions:
             normalized = user_text.strip().lower()
             if normalized in ("allow", "deny"):
                 async for chunk in self._resolve_permission(
-                    conversation_id, normalized, user_text
+                    chat_id, normalized, user_text
                 ):
                     yield chunk
                 return
             else:
                 # User sent an unrelated message while permission is pending.
-                # Auto-deny to unblock the daemon, then proceed with the new prompt.
+                # Auto-deny to unblock the daemon, then proceed with new prompt.
                 async for chunk in self._resolve_permission(
-                    conversation_id, "deny", "auto-denied: user sent unrelated message"
+                    chat_id, "deny", "auto-denied: user sent unrelated message"
                 ):
                     yield chunk
                 # Fall through to process the actual user message.
 
         # ── Normal turn ─────────────────────────────────────────────────────
-        async for chunk in self._run_turn(conversation_id, model, user_text):
+        async for chunk in self._run_turn(chat_id, model, user_text):
             yield chunk
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -195,19 +346,19 @@ class Pipe:
 
     async def _resolve_permission(
         self,
-        conversation_id: str,
+        chat_id: str,
         decision: str,
         reason: str,
     ) -> AsyncGenerator[str, None]:
         """Send session/permission_response for the pending request."""
-        request_id = self._pending_permissions.pop(conversation_id, None)
+        request_id = self._pending_permissions.pop(chat_id, None)
         if not request_id:
             return
 
-        session_id = self._sessions.get(conversation_id)
+        session_id = self._sessions.get(chat_id)
         if not session_id:
             yield self._sse_chunk(
-                f"[ACP Pipe warning] no active session for conversation; "
+                f"[ACP Pipe warning] no active session for chat; "
                 f"permission {decision} dropped"
             )
             return
@@ -219,7 +370,7 @@ class Pipe:
             ) as ws:
                 await self._rpc(ws, "initialize", {
                     "protocol_version": "0.2",
-                    "client_info": {"name": "openwebui-pipe", "version": "1.0"},
+                    "client_info": {"name": "openwebui-pipe", "version": "2.0"},
                 })
                 await self._rpc(ws, "session/resume", {"session_id": session_id})
                 await self._rpc(ws, "session/permission_response", {
@@ -248,7 +399,7 @@ class Pipe:
 
     async def _run_turn(
         self,
-        conversation_id: Optional[str],
+        chat_id: Optional[str],
         model: str,
         user_text: str,
     ) -> AsyncGenerator[str, None]:
@@ -259,18 +410,22 @@ class Pipe:
                 open_timeout=30.0,
             ) as ws:
                 # 1. Handshake
-                init_result = await self._rpc(ws, "initialize", {
+                await self._rpc(ws, "initialize", {
                     "protocol_version": "0.2",
-                    "client_info": {"name": "openwebui-pipe", "version": "1.0"},
+                    "client_info": {"name": "openwebui-pipe", "version": "2.0"},
                 })
 
                 # 2. Attach to session (resume or new)
-                session_id = self._sessions.get(conversation_id) if conversation_id else None
+                session_id: Optional[str] = (
+                    self._resolve_session(chat_id) if chat_id else None
+                )
                 if session_id:
                     try:
                         await self._rpc(ws, "session/resume", {"session_id": session_id})
                     except AcpError:
                         # Session gone (daemon restarted, session closed, etc.)
+                        # Clear stale mapping so we create a fresh one below.
+                        self._sessions.pop(chat_id, None)
                         session_id = None
 
                 if not session_id:
@@ -279,8 +434,8 @@ class Pipe:
                         "model": model,
                     })
                     session_id = result["session_id"]
-                    if conversation_id:
-                        self._sessions[conversation_id] = session_id
+                    if chat_id:
+                        self._persist_session(chat_id, session_id, self.valves.workspace_root)
 
                 # 3. Send prompt
                 turn_id = str(uuid.uuid4())
@@ -292,26 +447,15 @@ class Pipe:
 
                 # 4. Stream session/update notifications until TurnEnd or TurnError
                 turn_timeout = self.valves.permission_timeout_seconds + 60
-                # Use asyncio.wait_for on the entire streaming loop to enforce
-                # the turn timeout (permission wait + generation time).
-                try:
-                    # asyncio.timeout requires Python 3.11+ (Open WebUI >= 0.3 ships 3.11).
-                    # If you run Open WebUI on Python 3.10, remove the timeout block
-                    # and rely on the WebSocket's own connect_timeout instead.
-                    deadline = asyncio.get_event_loop().time() + turn_timeout
-                    async for chunk in self._stream_turn(ws, session_id, conversation_id):
-                        yield chunk
-                        if asyncio.get_event_loop().time() > deadline:
-                            yield self._sse_chunk(
-                                f"\n\n[ACP Pipe error] Turn exceeded {turn_timeout}s. "
-                                "Check daemon health."
-                            )
-                            break
-                except asyncio.CancelledError:
-                    yield self._sse_chunk(
-                        f"\n\n[ACP Pipe error] Turn cancelled after {turn_timeout}s timeout."
-                    )
-                    raise
+                deadline = asyncio.get_event_loop().time() + turn_timeout
+                async for chunk in self._stream_turn(ws, session_id, chat_id):
+                    yield chunk
+                    if asyncio.get_event_loop().time() > deadline:
+                        yield self._sse_chunk(
+                            f"\n\n[ACP Pipe error] Turn exceeded {turn_timeout}s. "
+                            "Check daemon health."
+                        )
+                        break
 
         except AcpError as exc:
             yield self._sse_chunk(f"[ACP error {exc.code}]: {exc}")
@@ -329,7 +473,7 @@ class Pipe:
         self,
         ws,
         session_id: str,
-        conversation_id: Optional[str],
+        chat_id: Optional[str],
     ) -> AsyncGenerator[str, None]:
         """
         Consume session/update notifications from the WebSocket until TurnEnd.
@@ -361,7 +505,7 @@ class Pipe:
                 if msg["method"] == "session/permission_request":
                     params = msg.get("params", {})
                     async for chunk in self._handle_permission_request(
-                        params, session_id, conversation_id
+                        params, session_id, chat_id
                     ):
                         yield chunk
                 continue
@@ -400,7 +544,7 @@ class Pipe:
 
             elif etype == "permission_request":
                 async for chunk in self._handle_permission_request(
-                    event, session_id, conversation_id
+                    event, session_id, chat_id
                 ):
                     yield chunk
 
@@ -444,7 +588,7 @@ class Pipe:
         self,
         event: dict,
         session_id: str,
-        conversation_id: Optional[str],
+        chat_id: Optional[str],
     ) -> AsyncGenerator[str, None]:
         """
         Handle an incoming permission_request event.
@@ -461,8 +605,8 @@ class Pipe:
             reason = event.get("reason") or ""
 
             # Store pending request so next user message can resolve it.
-            if conversation_id:
-                self._pending_permissions[conversation_id] = request_id
+            if chat_id:
+                self._pending_permissions[chat_id] = request_id
 
             # Yield a PERMISSION REQUEST block as visible text.
             block = (
