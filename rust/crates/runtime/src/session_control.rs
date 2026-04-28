@@ -552,6 +552,20 @@ fn workspace_roots_match(left: &Path, right: &Path) -> bool {
     canonicalize_for_compare(left) == canonicalize_for_compare(right)
 }
 
+/// Return `true` if `candidate` equals `prefix` exactly, OR if `candidate`
+/// starts with `prefix` followed by a path separator (`/`).
+///
+/// The trailing-separator check prevents false positives: `/home/adr` must
+/// not match `/home/adrian` even though the latter starts with the former as
+/// a string.
+///
+/// This mirrors the SQL `WHERE workspace_root = $1 OR workspace_root LIKE $2`
+/// predicate used in the Postgres backend (`backend_postgres.rs`).
+#[must_use]
+pub fn workspace_root_matches_prefix(candidate: &str, prefix: &str) -> bool {
+    candidate == prefix || candidate.starts_with(&format!("{prefix}/"))
+}
+
 fn canonicalize_for_compare(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -825,6 +839,16 @@ impl SessionBackend for FileSessionBackend {
         &self,
         workspace_root: &str,
     ) -> Result<Vec<SessionSummaryRow>, BackendError> {
+        // The FileSessionBackend's SessionStore is already scoped to a single
+        // workspace via its FNV-fingerprinted sessions_root.  Apply the same
+        // prefix-match contract as the Postgres backend: the store's workspace
+        // is included if it equals the requested workspace_root OR is a
+        // subdirectory of it (path-separator-aware).
+        let store_workspace = self.store.workspace_root().to_string_lossy().into_owned();
+        if !workspace_root_matches_prefix(&store_workspace, workspace_root) {
+            return Ok(Vec::new());
+        }
+
         let store = self.store.clone();
         let workspace_root = workspace_root.to_string();
         let closed: std::collections::HashSet<String> = {
@@ -883,6 +907,62 @@ impl SessionBackend for FileSessionBackend {
     ) -> Result<(), BackendError> {
         // File backend does not track client presence.
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod workspace_prefix_tests {
+    use super::workspace_root_matches_prefix;
+
+    // ------------------------------------------------------------------
+    // workspace_root_matches_prefix unit tests
+    // ------------------------------------------------------------------
+
+    /// Exact match must always return true.
+    #[test]
+    fn exact_match_still_works() {
+        assert!(workspace_root_matches_prefix("/home/adr", "/home/adr"));
+        assert!(workspace_root_matches_prefix(
+            "/home/adr/dev/foo",
+            "/home/adr/dev/foo"
+        ));
+    }
+
+    /// Subdirectories of the prefix must match.
+    #[test]
+    fn prefix_match_includes_subdirs() {
+        // Direct child.
+        assert!(workspace_root_matches_prefix(
+            "/home/adr/dev/foo",
+            "/home/adr"
+        ));
+        // Nested child.
+        assert!(workspace_root_matches_prefix(
+            "/home/adr/proj/deep/nested",
+            "/home/adr"
+        ));
+        // Child whose name starts exactly at the boundary.
+        assert!(workspace_root_matches_prefix("/home/adr/proj", "/home/adr"));
+    }
+
+    /// Siblings and unrelated paths must NOT match.
+    #[test]
+    fn prefix_match_excludes_siblings() {
+        // '/home/adr' must NOT match '/home/adrian' — the 'n' is not '/'
+        assert!(!workspace_root_matches_prefix("/home/adrian", "/home/adr"));
+        // Completely different subtree.
+        assert!(!workspace_root_matches_prefix("/home/other", "/home/adr"));
+        // Parent of the prefix — not a subdirectory.
+        assert!(!workspace_root_matches_prefix("/home", "/home/adr"));
+        // Empty string candidate must not match a non-empty prefix.
+        assert!(!workspace_root_matches_prefix("", "/home/adr"));
+    }
+
+    /// Empty prefix edge case: every path starts with "", so must match.
+    #[test]
+    fn empty_prefix_matches_everything() {
+        assert!(workspace_root_matches_prefix("/home/adr", ""));
+        assert!(workspace_root_matches_prefix("", ""));
     }
 }
 
@@ -969,9 +1049,91 @@ mod backend_tests {
         let session = Session::new().with_workspace_root(root.clone());
         backend.create_session(&session).await.unwrap();
 
-        let rows = backend.list_open_sessions("/").await.unwrap();
-        assert!(!rows.is_empty());
+        // Exact workspace match: must return the session.
+        let root_str = root.to_string_lossy();
+        let rows = backend.list_open_sessions(&root_str).await.unwrap();
+        assert!(!rows.is_empty(), "exact workspace_root must match");
         fs::remove_dir_all(root).ok();
+    }
+
+    // ------------------------------------------------------------------
+    // Prefix-match tests for FileSessionBackend (workspace subtree)
+    // ------------------------------------------------------------------
+
+    /// Sessions whose store workspace equals the requested root appear in the list.
+    #[tokio::test]
+    async fn file_backend_prefix_exact_match_still_works() {
+        let (backend, root) = make_backend();
+        let session = Session::new().with_workspace_root(root.clone());
+        backend.create_session(&session).await.unwrap();
+
+        let root_str = root.to_string_lossy().into_owned();
+        let rows = backend.list_open_sessions(&root_str).await.unwrap();
+        assert_eq!(rows.len(), 1, "exact match must return the session");
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A session in `/tmp/foo/bar` appears when listing with prefix `/tmp/foo`.
+    #[tokio::test]
+    async fn file_backend_prefix_match_includes_subdirs() {
+        // The store's workspace is a subdir; list with the parent prefix.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = std::env::temp_dir().join(format!("prefix-parent-{nanos}"));
+        let subdir = parent.join("child-workspace");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let store = SessionStore::from_cwd(&subdir).unwrap();
+        let backend = FileSessionBackend::new(store);
+        let session = Session::new().with_workspace_root(subdir.clone());
+        backend.create_session(&session).await.unwrap();
+
+        // List with the PARENT prefix — must include the session.
+        let parent_str = parent.to_string_lossy().into_owned();
+        let rows = backend.list_open_sessions(&parent_str).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "session in subdirectory must appear when listing with parent prefix"
+        );
+
+        // List with the exact subdir path — must also include the session.
+        let subdir_str = subdir.to_string_lossy().into_owned();
+        let rows_exact = backend.list_open_sessions(&subdir_str).await.unwrap();
+        assert_eq!(rows_exact.len(), 1, "exact subdirectory match must work");
+
+        fs::remove_dir_all(parent).ok();
+    }
+
+    /// A session in `/tmp/foo` must NOT appear when listing `/tmp/fo`
+    /// (sibling prefix without trailing separator).
+    #[tokio::test]
+    async fn file_backend_prefix_match_excludes_siblings() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("sibling-workspace-{nanos}"));
+        fs::create_dir_all(&workspace).unwrap();
+
+        let store = SessionStore::from_cwd(&workspace).unwrap();
+        let backend = FileSessionBackend::new(store);
+        let session = Session::new().with_workspace_root(workspace.clone());
+        backend.create_session(&session).await.unwrap();
+
+        // Construct a sibling prefix by stripping one character: not a real parent.
+        let ws_str = workspace.to_string_lossy().into_owned();
+        let sibling_prefix = &ws_str[..ws_str.len() - 1]; // remove trailing char
+
+        let rows = backend.list_open_sessions(sibling_prefix).await.unwrap();
+        assert!(
+            rows.is_empty(),
+            "sibling path (sharing a common prefix without '/') must NOT match"
+        );
+
+        fs::remove_dir_all(workspace).ok();
     }
 }
 

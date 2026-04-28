@@ -380,17 +380,26 @@ impl SessionBackend for PostgresSessionBackend {
         &self,
         workspace_root: &str,
     ) -> Result<Vec<SessionSummaryRow>, BackendError> {
+        // Prefix match: exact workspace_root OR any subdirectory (separated by
+        // '/').  We escape '%' and '_' in the prefix before constructing the
+        // LIKE pattern so filesystem paths with those characters don't produce
+        // false positives.  The trailing '/%' anchors the pattern to a path
+        // boundary, preventing e.g. '/home/adr' from matching '/home/adrian'.
+        let escaped = workspace_root.replace('%', "\\%").replace('_', "\\_");
+        let prefix_pattern = format!("{escaped}/%");
         let rows = sqlx::query(
             r#"
             SELECT s.session_id, s.workspace_root, s.model, s.created_at_ms, s.updated_at_ms,
                    (SELECT COUNT(*)::BIGINT FROM session_events e WHERE e.session_id = s.session_id)
                        AS message_count
             FROM sessions s
-            WHERE s.workspace_root = $1 AND s.closed_at_ms IS NULL
+            WHERE (s.workspace_root = $1 OR s.workspace_root LIKE $2 ESCAPE '\')
+              AND s.closed_at_ms IS NULL
             ORDER BY s.updated_at_ms DESC
             "#,
         )
         .bind(workspace_root)
+        .bind(&prefix_pattern)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| BackendError::Database(format!("list_open_sessions query failed: {e}")))?;
