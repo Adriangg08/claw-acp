@@ -2296,6 +2296,57 @@ pub fn handle_plugins_slash_command(
     }
 }
 
+/// Fields from a custom agent TOML definition relevant to spawning.
+///
+/// Only fields that influence how the runtime creates the sub-agent are included here.
+/// Callers that need the full `AgentSummary` (e.g. the `agents` CLI listing) continue to
+/// use the private `load_agents_from_roots` path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentDefinition {
+    /// The model identifier declared in the TOML (e.g. `"deepseek-v4-pro"`).
+    pub model: Option<String>,
+    /// The `model_reasoning_effort` field from the TOML (e.g. `"high"`).
+    pub reasoning_effort: Option<String>,
+}
+
+/// Look up the first non-shadowed agent definition whose `name` matches `agent_name`
+/// (case-insensitive), searching the standard agent roots relative to `cwd`.
+///
+/// Returns `None` when no matching TOML is found or when I/O errors prevent reading a
+/// directory (graceful degradation — callers fall back to the global default model).
+pub fn lookup_agent_definition(cwd: &Path, agent_name: &str) -> Option<AgentDefinition> {
+    let roots = discover_definition_roots(cwd, "agents");
+    let target = agent_name.to_ascii_lowercase();
+
+    for (_source, root) in &roots {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "toml") {
+                continue;
+            }
+            let Ok(contents) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let fallback_name = path.file_stem().map_or_else(
+                || entry.file_name().to_string_lossy().to_string(),
+                |stem| stem.to_string_lossy().to_string(),
+            );
+            let name = parse_toml_string(&contents, "name").unwrap_or(fallback_name);
+            if name.to_ascii_lowercase() == target {
+                return Some(AgentDefinition {
+                    model: parse_toml_string(&contents, "model"),
+                    reasoning_effort: parse_toml_string(&contents, "model_reasoning_effort"),
+                });
+            }
+        }
+    }
+
+    None
+}
+
 pub fn handle_agents_slash_command(args: Option<&str>, cwd: &Path) -> std::io::Result<String> {
     if let Some(args) = normalize_optional_args(args) {
         if let Some(help_path) = help_path_from_args(args) {

@@ -3496,7 +3496,13 @@ where
     let output_file = output_dir.join(format!("{agent_id}.md"));
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
-    let model = resolve_agent_model(input.model.as_deref());
+    let toml_definition = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| commands::lookup_agent_definition(&cwd, &normalized_subagent_type));
+    let model = resolve_agent_model(
+        input.model.as_deref(),
+        toml_definition.as_ref().and_then(|d| d.model.as_deref()),
+    );
     let agent_name = input
         .name
         .as_deref()
@@ -3632,10 +3638,17 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
     Ok(prompt)
 }
 
-fn resolve_agent_model(model: Option<&str>) -> String {
-    model
+/// Resolve the model to use for a sub-agent spawn.
+///
+/// Precedence (highest to lowest):
+/// 1. `call_override` — explicit `model` field in the Agent tool call.
+/// 2. `toml_model` — `model` field from the matching agent TOML definition.
+/// 3. `DEFAULT_AGENT_MODEL` — global compile-time fallback.
+fn resolve_agent_model(call_override: Option<&str>, toml_model: Option<&str>) -> String {
+    call_override
         .map(str::trim)
-        .filter(|model| !model.is_empty())
+        .filter(|m| !m.is_empty())
+        .or_else(|| toml_model.map(str::trim).filter(|m| !m.is_empty()))
         .unwrap_or(DEFAULT_AGENT_MODEL)
         .to_string()
 }
@@ -6156,8 +6169,8 @@ mod tests {
         derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
         final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
         permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SubagentToolExecutor,
+        resolve_agent_model, run_task_packet, AgentInput, AgentJob, GlobalToolRegistry,
+        LaneEventName, LaneFailureClass, ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -8507,6 +8520,107 @@ mod tests {
         )
         .expect_err("blank prompt should fail");
         assert!(missing_prompt.contains("prompt must not be empty"));
+    }
+
+    #[test]
+    fn resolve_agent_model_respects_precedence() {
+        // 1. Explicit call override wins over everything.
+        assert_eq!(
+            resolve_agent_model(Some("call-model"), Some("toml-model")),
+            "call-model"
+        );
+
+        // 2. TOML model is used when no explicit override is given.
+        assert_eq!(
+            resolve_agent_model(None, Some("toml-model")),
+            "toml-model"
+        );
+
+        // 3. Blank override is treated as absent — TOML model wins.
+        assert_eq!(
+            resolve_agent_model(Some("  "), Some("toml-model")),
+            "toml-model"
+        );
+
+        // 4. Both absent → fall back to DEFAULT_AGENT_MODEL.
+        assert_eq!(
+            resolve_agent_model(None, None),
+            super::DEFAULT_AGENT_MODEL
+        );
+
+        // 5. Both blank → fall back to DEFAULT_AGENT_MODEL.
+        assert_eq!(
+            resolve_agent_model(Some(""), Some("")),
+            super::DEFAULT_AGENT_MODEL
+        );
+    }
+
+    #[test]
+    fn agent_spawn_uses_toml_model_when_no_call_override() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Create a temp dir that acts as a project root with a .claw/agents/ TOML.
+        let project_dir = temp_path("agent-toml-model-project");
+        let agents_dir = project_dir.join(".claw").join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("create agents dir");
+        std::fs::write(
+            agents_dir.join("code-implementer.toml"),
+            "name = \"code-implementer\"\ndescription = \"test\"\nmodel = \"deepseek-v4-pro\"\n",
+        )
+        .expect("write agent TOML");
+
+        let store_dir = temp_path("agent-toml-model-store");
+        std::env::set_var("CLAWD_AGENT_STORE", &store_dir);
+
+        // Change cwd so discover_definition_roots can find the TOML.
+        let original_cwd = std::env::current_dir().ok();
+        std::env::set_current_dir(&project_dir).expect("set cwd to project dir");
+
+        let captured_model: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured_for_spawn = Arc::clone(&captured_model);
+
+        let result = execute_agent_with_spawn(
+            AgentInput {
+                description: "Implement a feature".to_string(),
+                prompt: "Write the code.".to_string(),
+                subagent_type: Some("code-implementer".to_string()),
+                name: None,
+                model: None, // no explicit override — should pick up TOML model
+            },
+            move |job| {
+                *captured_for_spawn
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    job.manifest.model.clone();
+                Ok(())
+            },
+        );
+
+        // Restore cwd before any assertion so subsequent tests aren't affected.
+        if let Some(cwd) = original_cwd {
+            let _ = std::env::set_current_dir(cwd);
+        }
+        std::env::remove_var("CLAWD_AGENT_STORE");
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let _ = std::fs::remove_dir_all(&project_dir);
+
+        let manifest = result.expect("spawn should succeed");
+        assert_eq!(
+            manifest.model.as_deref(),
+            Some("deepseek-v4-pro"),
+            "manifest should carry the TOML model"
+        );
+        let resolved = captured_model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("deepseek-v4-pro"),
+            "job manifest should also carry the TOML model"
+        );
     }
 
     #[test]
